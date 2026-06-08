@@ -338,7 +338,7 @@ tr:hover td{background:#1e293b}
 .modal h3{color:#7dd3fc;margin-bottom:18px;font-size:1rem}
 label{display:block;font-size:.8rem;color:#94a3b8;margin-bottom:4px;margin-top:12px}
 label:first-of-type{margin-top:0}
-input[type=text],input[type=number],select{width:100%;background:#0f172a;border:1px solid #334155;border-radius:7px;color:#e2e8f0;padding:8px 10px;font-size:.9rem;outline:none}
+input[type=text],input[type=number],input[type=password],select{width:100%;background:#0f172a;border:1px solid #334155;border-radius:7px;color:#e2e8f0;padding:8px 10px;font-size:.9rem;outline:none}
 input:focus,select:focus{border-color:#7dd3fc}
 select option{background:#1e293b}
 .modal-foot{display:flex;gap:8px;margin-top:18px;justify-content:flex-end}
@@ -375,10 +375,17 @@ select option{background:#1e293b}
   </select>
   
   <label>Коррекция датчика температуры (°C)</label>
-  <div style="display:flex;gap:8px;">
+  <div style="display:flex;gap:8px;margin-bottom: 14px;">
     <input type="number" id="setTempOffset" step="0.1" placeholder="0.0" style="flex:1;">
     <button class="btn btn-pri" onclick="saveTempOffset()">Сохранить</button>
   </div>
+
+  <label>Изменить пароль администратора</label>
+  <div style="display:flex;gap:8px;">
+    <input type="password" id="setNewPassword" placeholder="Новый пароль" style="flex:1;">
+    <button class="btn btn-pri" onclick="savePassword()">Изменить</button>
+  </div>
+  
   <div id="setErr" style="color:#ef4444;font-size:.8rem;margin-top:8px"></div>
   <div id="setOk" style="color:#22c55e;font-size:.8rem;margin-top:8px"></div>
 </div>
@@ -528,6 +535,39 @@ function saveTempOffset() {
     .then(d => {
       if (d.ok) {
         okDiv.textContent = 'Настройки сохранены';
+      } else {
+        errDiv.textContent = d.err || 'Ошибка при сохранении';
+      }
+    })
+    .catch(() => {
+      errDiv.textContent = 'Ошибка соединения';
+    });
+}
+
+function savePassword() {
+  const pwInput = document.getElementById('setNewPassword');
+  const pw = pwInput.value.trim();
+  const errDiv = document.getElementById('setErr');
+  const okDiv = document.getElementById('setOk');
+  
+  errDiv.textContent = '';
+  okDiv.textContent = '';
+  
+  if (pw.length < 4 || pw.length > 32) {
+    errDiv.textContent = 'Длина пароля должна быть от 4 до 32 символов';
+    return;
+  }
+  
+  fetch('/api/settings/password', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'newPassword=' + encodeURIComponent(pw)
+  })
+    .then(r => r.json())
+    .then(d => {
+      if (d.ok) {
+        okDiv.textContent = 'Пароль успешно изменен';
+        pwInput.value = '';
       } else {
         errDiv.textContent = d.err || 'Ошибка при сохранении';
       }

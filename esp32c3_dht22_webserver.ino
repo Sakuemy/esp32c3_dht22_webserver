@@ -27,7 +27,7 @@
 // ════════════════════════════════════════════════════════
 //  ▸ НАСТРОЙКИ — измените под свою сеть
 // ════════════════════════════════════════════════════════
-const char* ADMIN_PASSWORD      = "admin123";   // пароль личного кабинета
+static String adminPassword     = "admin123";   // пароль личного кабинета
 const long  GMT_OFFSET_SEC      = 3 * 3600;     // UTC+3 (Москва)
 const int   DAYLIGHT_OFFSET_SEC = 0;
 
@@ -115,12 +115,14 @@ void deleteDeviceFromNVS(int idx) {
 void loadSettings() {
   prefs.begin("settings", true);
   tempOffset = prefs.getFloat("tempOffset", 0.0f);
+  adminPassword = prefs.getString("adminPw", "admin123");
   prefs.end();
 }
 
 void saveSettings() {
   prefs.begin("settings", false);
   prefs.putFloat("tempOffset", tempOffset);
+  prefs.putString("adminPw", adminPassword);
   prefs.end();
 }
 
@@ -376,7 +378,7 @@ void setup() {
     blinkTx();
     if (req->hasParam("pw", true)) {
       String pw = req->getParam("pw", true)->value();
-      if (pw == ADMIN_PASSWORD) {
+      if (pw == adminPassword) {
         generateToken();
         AsyncWebServerResponse* resp = req->beginResponse(200, "application/json", "{\"ok\":true}");
         String cookie = String("esp_sess=") + sessionToken + "; Path=/; HttpOnly";
@@ -512,6 +514,25 @@ void setup() {
       req->send(200, "application/json", "{\"ok\":true}");
     } else {
       req->send(200, "application/json", "{\"ok\":false,\"err\":\"missing tempOffset\"}");
+    }
+  });
+
+  // POST /api/settings/password
+  server.on("/api/settings/password", HTTP_POST, [](AsyncWebServerRequest* req) {
+    blinkTx();
+    if (!isAuthorized(req)) { req->send(403, "application/json", "{\"error\":\"forbidden\"}"); return; }
+    if (req->hasParam("newPassword", true)) {
+      String newPw = req->getParam("newPassword", true)->value();
+      newPw.trim();
+      if (newPw.length() < 4 || newPw.length() > 32) {
+        req->send(200, "application/json", "{\"ok\":false,\"err\":\"Длина пароля должна быть от 4 до 32 символов\"}");
+        return;
+      }
+      adminPassword = newPw;
+      saveSettings();
+      req->send(200, "application/json", "{\"ok\":true}");
+    } else {
+      req->send(200, "application/json", "{\"ok\":false,\"err\":\"missing newPassword\"}");
     }
   });
 
