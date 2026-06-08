@@ -36,7 +36,7 @@ const int   DAYLIGHT_OFFSET_SEC = 0;
 //    Прибавляется к каждому замеру температуры.
 //    Положительное — повысить показания, отрицательное — понизить.
 // ════════════════════════════════════════════════════════
-const float TEMP_OFFSET = 0.0f;
+static float tempOffset = 0.0f;
 
 // ════════════════════════════════════════════════════════
 //  ▸ ПИНЫ
@@ -109,6 +109,18 @@ void deleteDeviceFromNVS(int idx) {
   char key[12];
   snprintf(key, sizeof(key), "dev%d", idx);
   prefs.remove(key);
+  prefs.end();
+}
+
+void loadSettings() {
+  prefs.begin("settings", true);
+  tempOffset = prefs.getFloat("tempOffset", 0.0f);
+  prefs.end();
+}
+
+void saveSettings() {
+  prefs.begin("settings", false);
+  prefs.putFloat("tempOffset", tempOffset);
   prefs.end();
 }
 
@@ -227,7 +239,8 @@ static const char* buildApiJson() {
   MUTEX_GIVE();
 
   char* p = jsonBuf, *end = jsonBuf + JSON_BUF_SIZE - 1;
-  p += snprintf(p, end-p, "{\"unixSec\":%lu,", (unsigned long)nowT);
+  unsigned long uptime = millis() / 1000;
+  p += snprintf(p, end-p, "{\"unixSec\":%lu,\"uptime\":%lu,", (unsigned long)nowT, uptime);
   if (isnan(lt)) p += snprintf(p, end-p, "\"temp\":null,");
   else           p += snprintf(p, end-p, "\"temp\":%.1f,", lt);
   if (isnan(lh)) p += snprintf(p, end-p, "\"hum\":null,");
@@ -318,6 +331,7 @@ void setup() {
 
   dht.begin();
   initHistory();
+  loadSettings();
   loadDevices();  // загружаем устройства из NVS и восстанавливаем состояние пинов
 
   // WiFi
@@ -479,6 +493,28 @@ void setup() {
     req->send(200, "application/json", "{\"ok\":true}");
   });
 
+  // GET /api/settings
+  server.on("/api/settings", HTTP_GET, [](AsyncWebServerRequest* req) {
+    blinkTx();
+    if (!isAuthorized(req)) { req->send(403, "application/json", "{\"error\":\"forbidden\"}"); return; }
+    char buf[128];
+    snprintf(buf, sizeof(buf), "{\"tempOffset\":%.2f}", tempOffset);
+    req->send(200, "application/json", buf);
+  });
+
+  // POST /api/settings/save
+  server.on("/api/settings/save", HTTP_POST, [](AsyncWebServerRequest* req) {
+    blinkTx();
+    if (!isAuthorized(req)) { req->send(403, "application/json", "{\"error\":\"forbidden\"}"); return; }
+    if (req->hasParam("tempOffset", true)) {
+      tempOffset = req->getParam("tempOffset", true)->value().toFloat();
+      saveSettings();
+      req->send(200, "application/json", "{\"ok\":true}");
+    } else {
+      req->send(200, "application/json", "{\"ok\":false,\"err\":\"missing tempOffset\"}");
+    }
+  });
+
   // POST /api/device/toggle
   server.on("/api/device/toggle", HTTP_POST, [](AsyncWebServerRequest* req) {
     blinkTx();
@@ -524,7 +560,7 @@ void loop() {
     float t = dht.readTemperature();
     float h = dht.readHumidity();
     if (!isnan(t) && !isnan(h)) {
-      t += TEMP_OFFSET;   // ← калибровка
+      t += tempOffset;   // ← калибровка
       if (MUTEX_TAKE() == pdTRUE) {
         curTemp = t;
         curHum  = h;

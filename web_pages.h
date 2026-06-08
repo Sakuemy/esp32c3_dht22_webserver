@@ -9,6 +9,7 @@ static const char HTML_MAIN[] PROGMEM = R"rawliteral(
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
+<script>document.documentElement.style.fontSize=(localStorage.getItem('fontSize')||'16')+'px';</script>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ESP32-C3 Monitor</title>
 <style>
@@ -41,6 +42,7 @@ canvas{flex:1;width:100%!important;min-height:0;display:block;cursor:crosshair}
   <span class="logo">ESP32-C3 Monitor</span>
   <div class="hdr-r">
     <span id="clock">--:--:--</span>
+    <span id="uptime" style="font-size:.82rem;color:#64748b">Аптайм: --</span>
     <span><span class="dot off-dot" id="stDot"></span><span id="stTxt" class="off">Offline</span></span>
     <a class="admin-link" href="/admin">Кабинет</a>
   </div>
@@ -183,27 +185,71 @@ function tick(){const d=new Date(Date.now()+tsOff);document.getElementById('cloc
 setInterval(tick,1000);tick();
 
 // Статус
-let online=false,offTmr=null;
+let online=false;
 function setSt(on){
   if(online===on)return;online=on;
   document.getElementById('stDot').className='dot '+(on?'on-dot':'off-dot');
   const t=document.getElementById('stTxt');t.className=on?'on':'off';t.textContent=on?'Online':'Offline';
 }
 
-// Polling
-function poll(){
-  fetch('/api/data',{cache:'no-store'})
-    .then(r=>r.ok?r.json():Promise.reject())
-    .then(d=>{
-      tsOff=d.unixSec*1000-Date.now();
-      clearTimeout(offTmr);setSt(true);offTmr=setTimeout(()=>setSt(false),9000);
-      document.getElementById('tV').textContent=d.temp!=null?d.temp.toFixed(1)+' °C':'--.- °C';
-      document.getElementById('hV').textContent=d.hum !=null?d.hum.toFixed(1) +' %' :'--.- %';
-      window._chartUpdate(d.chart);
-    })
-    .catch(()=>{clearTimeout(offTmr);setSt(false);});
+// Форматирование аптайма
+function formatUptime(sec) {
+  const d = Math.floor(sec / (24 * 3600));
+  sec %= (24 * 3600);
+  const h = Math.floor(sec / 3600);
+  sec %= 3600;
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  
+  let res = '';
+  if (d > 0) res += d + ' д. ';
+  if (d > 0 || h > 0) res += h + ' ч. ';
+  if (d > 0 || h > 0 || m > 0) res += m + ' мин. ';
+  res += s + ' сек.';
+  return res;
 }
-poll();setInterval(poll,3000);
+
+// Polling с таймаутом и 3 попытками
+let failedCount = 0;
+let pollTmr = null;
+
+function poll() {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 6000); // 6 секунд таймаут
+
+  fetch('/api/data', { cache: 'no-store', signal: controller.signal })
+    .then(r => r.ok ? r.json() : Promise.reject())
+    .then(d => {
+      clearTimeout(timeoutId);
+      failedCount = 0;
+      setSt(true);
+      tsOff = d.unixSec * 1000 - Date.now();
+      document.getElementById('tV').textContent = d.temp != null ? d.temp.toFixed(1) + ' °C' : '--.- °C';
+      document.getElementById('hV').textContent = d.hum != null ? d.hum.toFixed(1) + ' %' : '--.- %';
+      document.getElementById('uptime').textContent = 'Аптайм: ' + formatUptime(d.uptime);
+      window._chartUpdate(d.chart);
+      scheduleNextPoll(60000); // Опрос раз в минуту
+    })
+    .catch(() => {
+      clearTimeout(timeoutId);
+      failedCount++;
+      if (failedCount >= 3) {
+        setSt(false);
+      }
+      if (failedCount < 3) {
+        setTimeout(poll, 1500); // Быстрая перепопытка через 1.5 сек
+      } else {
+        scheduleNextPoll(60000); // Регулярный опрос раз в минуту
+      }
+    });
+}
+
+function scheduleNextPoll(ms) {
+  clearTimeout(pollTmr);
+  pollTmr = setTimeout(poll, ms);
+}
+
+poll();
 </script>
 </body>
 </html>
@@ -217,6 +263,7 @@ static const char HTML_LOGIN[] PROGMEM = R"rawliteral(
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
+<script>document.documentElement.style.fontSize=(localStorage.getItem('fontSize')||'16')+'px';</script>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Вход — ESP32-C3</title>
 <style>
@@ -263,6 +310,7 @@ static const char HTML_ADMIN[] PROGMEM = R"rawliteral(
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
+<script>document.documentElement.style.fontSize=(localStorage.getItem('fontSize')||'16')+'px';</script>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Кабинет — ESP32-C3</title>
 <style>
@@ -311,6 +359,29 @@ select option{background:#1e293b}
   <thead><tr><th>Название</th><th>GPIO</th><th>Статус</th><th>Действия</th></tr></thead>
   <tbody id="tbody"></tbody>
 </table>
+
+<!-- Раздел настроек -->
+<div class="hdr" style="margin-top: 32px;">
+  <h1>Настройки системы</h1>
+</div>
+
+<div style="background:#1e293b;border:1px solid #334155;border-radius:14px;padding:20px;max-width:450px;">
+  <label>Размер шрифта интерфейса</label>
+  <select id="setfontSize" onchange="changefontSize(this.value)" style="margin-bottom: 14px;">
+    <option value="14">Мелкий (14px)</option>
+    <option value="16">Средний (16px)</option>
+    <option value="18">Крупный (18px)</option>
+    <option value="20">Очень крупный (20px)</option>
+  </select>
+  
+  <label>Коррекция датчика температуры (°C)</label>
+  <div style="display:flex;gap:8px;">
+    <input type="number" id="setTempOffset" step="0.1" placeholder="0.0" style="flex:1;">
+    <button class="btn btn-pri" onclick="saveTempOffset()">Сохранить</button>
+  </div>
+  <div id="setErr" style="color:#ef4444;font-size:.8rem;margin-top:8px"></div>
+  <div id="setOk" style="color:#22c55e;font-size:.8rem;margin-top:8px"></div>
+</div>
 
 <!-- Модалка добавления/редактирования -->
 <div class="overlay" id="modal">
@@ -417,7 +488,57 @@ function toggleDev(id){
 // Закрыть по клику на фон
 document.getElementById('modal').addEventListener('click',function(e){if(e.target===this)closeModal();});
 
+function loadConfig() {
+  const currentSize = localStorage.getItem('fontSize') || '16';
+  document.getElementById('setfontSize').value = currentSize;
+  
+  fetch('/api/settings')
+    .then(r => r.json())
+    .then(d => {
+      document.getElementById('setTempOffset').value = d.tempOffset;
+    })
+    .catch(() => {});
+}
+
+function changefontSize(size) {
+  localStorage.setItem('fontSize', size);
+  document.documentElement.style.fontSize = size + 'px';
+}
+
+function saveTempOffset() {
+  const offsetInput = document.getElementById('setTempOffset');
+  const offset = parseFloat(offsetInput.value);
+  const errDiv = document.getElementById('setErr');
+  const okDiv = document.getElementById('setOk');
+  
+  errDiv.textContent = '';
+  okDiv.textContent = '';
+  
+  if (isNaN(offset)) {
+    errDiv.textContent = 'Введите корректное число';
+    return;
+  }
+  
+  fetch('/api/settings/save', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'tempOffset=' + encodeURIComponent(offset)
+  })
+    .then(r => r.json())
+    .then(d => {
+      if (d.ok) {
+        okDiv.textContent = 'Настройки сохранены';
+      } else {
+        errDiv.textContent = d.err || 'Ошибка при сохранении';
+      }
+    })
+    .catch(() => {
+      errDiv.textContent = 'Ошибка соединения';
+    });
+}
+
 load();
+loadConfig();
 </script>
 </body>
 </html>
