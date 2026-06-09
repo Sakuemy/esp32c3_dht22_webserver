@@ -41,6 +41,15 @@ canvas{flex:1;width:100%!important;min-height:0;display:block;cursor:crosshair}
 <div class="hdr">
   <span class="logo">ESP32-C3 Monitor</span>
   <div class="hdr-r">
+    <div id="bat-container" style="display:flex;align-items:center;gap:6px;font-size:.82rem;color:#94a3b8">
+      <svg id="bat-svg" width="22" height="12" viewBox="0 0 22 12" fill="none" xmlns="http://www.w3.org/2000/svg" style="vertical-align:middle">
+        <rect x="0.75" y="0.75" width="17.5" height="10.5" rx="1.75" stroke="#94a3b8" stroke-width="1.5"/>
+        <path d="M20 4V8" stroke="#94a3b8" stroke-width="1.5" stroke-linecap="round"/>
+        <rect id="bat-fill" x="2.5" y="2.5" width="14" height="7" rx="0.75" fill="#22c55e"/>
+        <line id="bat-cross" x1="1" y1="11" x2="20" y2="1" stroke="#ef4444" stroke-width="1.5" style="display:none;"/>
+      </svg>
+      <span id="bat-text">--% (--.-- В)</span>
+    </div>
     <span id="clock">--:--:--</span>
     <span id="uptime" style="font-size:.82rem;color:#64748b">Аптайм: --</span>
     <span><span class="dot off-dot" id="stDot"></span><span id="stTxt" class="off">Offline</span></span>
@@ -227,6 +236,30 @@ function poll() {
       document.getElementById('tV').textContent = d.temp != null ? d.temp.toFixed(1) + ' °C' : '--.- °C';
       document.getElementById('hV').textContent = d.hum != null ? d.hum.toFixed(1) + ' %' : '--.- %';
       document.getElementById('uptime').textContent = 'Аптайм: ' + formatUptime(d.uptime);
+      
+      // Считывание и отрисовка батареи
+      const batFill = document.getElementById('bat-fill');
+      const batCross = document.getElementById('bat-cross');
+      const batText = document.getElementById('bat-text');
+      if (d.batLevel === -1 || d.batLevel === null) {
+        batFill.style.display = 'none';
+        batCross.style.display = 'block';
+        batText.textContent = '— (—.—— В)';
+      } else {
+        batFill.style.display = 'block';
+        batCross.style.display = 'none';
+        const w = Math.round((d.batLevel / 100) * 14);
+        batFill.setAttribute('width', w);
+        if (d.batLevel > 50) {
+          batFill.setAttribute('fill', '#22c55e');
+        } else if (d.batLevel > 20) {
+          batFill.setAttribute('fill', '#eab308');
+        } else {
+          batFill.setAttribute('fill', '#ef4444');
+        }
+        batText.textContent = d.batLevel + '% (' + d.batVolts.toFixed(2) + ' В)';
+      }
+
       window._chartUpdate(d.chart);
       scheduleNextPoll(60000); // Опрос раз в минуту
     })
@@ -331,6 +364,29 @@ tr:hover td{background:#1e293b}
 .badge{display:inline-block;padding:2px 9px;border-radius:99px;font-size:.75rem;font-weight:600}
 .badge-on{background:#14532d;color:#4ade80}
 .badge-off{background:#3b0764;color:#c084fc}
+
+/* Tabs */
+.tabs-nav {display:flex;gap:10px;border-bottom:2px solid #334155;margin-bottom:20px}
+.tab-btn {background:none;border:none;color:#94a3b8;font-size:1rem;font-weight:600;padding:10px 16px;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-2px;transition:all .2s ease}
+.tab-btn:hover {color:#e2e8f0}
+.tab-btn.active {color:#7dd3fc;border-bottom-color:#38bdf8}
+.tab-content {display:none}
+.tab-content.active {display:block}
+
+/* Settings Grid */
+.settings-grid {display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px;margin-bottom:20px}
+.sett-card {background:#1e293b;border:1px solid #334155;border-radius:12px;padding:16px}
+.sett-card h3 {color:#7dd3fc;font-size:0.95rem;margin-bottom:12px;border-bottom:1px solid #334155;padding-bottom:6px}
+.sett-group {margin-bottom:12px}
+.sett-group:last-child {margin-bottom:0}
+.sett-group-row {margin-bottom:12px;display:flex;align-items:center}
+.switch-label {display:flex;align-items:center;gap:8px;cursor:pointer;font-size:0.85rem;color:#e2e8f0;user-select:none}
+.switch-label input[type=checkbox] {width:16px;height:16px;accent-color:#38bdf8;cursor:pointer}
+.sett-actions {display:flex;align-items:center;gap:12px;margin-top:20px}
+.sett-msg {font-size:0.85rem}
+.err-msg {color:#ef4444}
+.ok-msg {color:#22c55e}
+
 /* Модалка */
 .overlay{position:fixed;inset:0;background:#00000088;display:flex;align-items:center;justify-content:center;z-index:100;display:none}
 .overlay.open{display:flex}
@@ -347,47 +403,106 @@ select option{background:#1e293b}
 </head>
 <body>
 <div class="hdr">
-  <h1>Управление устройствами</h1>
+  <h1 id="page-title">Панель управления</h1>
   <div class="hdr-r">
-    <button class="btn btn-pri" onclick="openModal()">+ Добавить</button>
+    <button id="btn-add-dev" class="btn btn-pri" onclick="openModal()">+ Добавить</button>
     <a class="btn btn-sec" href="/logout">Выйти</a>
     <a class="btn btn-sec" href="/">← Главная</a>
   </div>
 </div>
 
-<table id="tbl">
-  <thead><tr><th>Название</th><th>GPIO</th><th>Статус</th><th>Действия</th></tr></thead>
-  <tbody id="tbody"></tbody>
-</table>
-
-<!-- Раздел настроек -->
-<div class="hdr" style="margin-top: 32px;">
-  <h1>Настройки системы</h1>
+<div class="tabs-nav">
+  <button id="tab-btn-devices" class="tab-btn active" onclick="switchTab('devices')">Устройства</button>
+  <button id="tab-btn-settings" class="tab-btn" onclick="switchTab('settings')">Настройки</button>
 </div>
 
-<div style="background:#1e293b;border:1px solid #334155;border-radius:14px;padding:20px;max-width:450px;">
-  <label>Размер шрифта интерфейса</label>
-  <select id="setfontSize" onchange="changefontSize(this.value)" style="margin-bottom: 14px;">
-    <option value="14">Мелкий (14px)</option>
-    <option value="16">Средний (16px)</option>
-    <option value="18">Крупный (18px)</option>
-    <option value="20">Очень крупный (20px)</option>
-  </select>
-  
-  <label>Коррекция датчика температуры (°C)</label>
-  <div style="display:flex;gap:8px;margin-bottom: 14px;">
-    <input type="number" id="setTempOffset" step="0.1" placeholder="0.0" style="flex:1;">
-    <button class="btn btn-pri" onclick="saveTempOffset()">Сохранить</button>
+<!-- Вкладка: Устройства -->
+<div id="tab-devices" class="tab-content active">
+  <table id="tbl">
+    <thead><tr><th>Название</th><th>GPIO</th><th>Статус</th><th>Действия</th></tr></thead>
+    <tbody id="tbody"></tbody>
+  </table>
+</div>
+
+<!-- Вкладка: Настройки -->
+<div id="tab-settings" class="tab-content">
+  <div class="settings-grid">
+    <!-- Категория 1: Основные -->
+    <div class="sett-card">
+      <h3>Основные настройки</h3>
+      <div class="sett-group">
+        <label for="setfontSize">Размер шрифта интерфейса</label>
+        <select id="setfontSize" onchange="changefontSize(this.value)">
+          <option value="14">Мелкий (14px)</option>
+          <option value="16">Средний (16px)</option>
+          <option value="18">Крупный (18px)</option>
+          <option value="20">Очень крупный (20px)</option>
+        </select>
+      </div>
+      <div class="sett-group">
+        <label for="setTempOffset">Коррекция датчика температуры (°C)</label>
+        <input type="number" id="setTempOffset" step="0.1" placeholder="0.0">
+      </div>
+    </div>
+
+    <!-- Категория 2: Батарея -->
+    <div class="sett-card">
+      <h3>Параметры батареи</h3>
+      <div class="sett-group">
+        <label for="setBatMax">Заряженная батарея (В)</label>
+        <input type="number" id="setBatMax" step="0.05" placeholder="4.20">
+      </div>
+      <div class="sett-group">
+        <label for="setBatMin">Разряженная батарея (В)</label>
+        <input type="number" id="setBatMin" step="0.05" placeholder="3.00">
+      </div>
+      <div class="sett-group">
+        <label for="setBatR1">Резистор R1 — верхний (Ом)</label>
+        <input type="number" id="setBatR1" placeholder="230000">
+      </div>
+      <div class="sett-group">
+        <label for="setBatR2">Резистор R2 — нижний к GND (Ом)</label>
+        <input type="number" id="setBatR2" placeholder="1033000">
+      </div>
+      <div class="sett-group">
+        <label for="setBatCalib">Калибровочный коэффициент ADC</label>
+        <input type="number" id="setBatCalib" step="0.001" min="0.5" max="2.0" placeholder="1.000">
+        <div style="font-size:.75rem;color:#64748b;margin-top:4px">Умножается на расчётное напряжение. Увеличьте если показания занижены, уменьшите если завышены.</div>
+      </div>
+    </div>
+
+    <!-- Категория 3: Индикация -->
+    <div class="sett-card">
+      <h3>Индикация</h3>
+      <div class="sett-group-row">
+        <label class="switch-label">
+          <input type="checkbox" id="setLedWifi">
+          <span class="switch-text">Индикация WiFi (светодиод WiFi)</span>
+        </label>
+      </div>
+      <div class="sett-group-row">
+        <label class="switch-label">
+          <input type="checkbox" id="setLedTx">
+          <span class="switch-text">Индикация передачи (светодиод TX)</span>
+        </label>
+      </div>
+    </div>
+
+    <!-- Категория 4: Безопасность -->
+    <div class="sett-card">
+      <h3>Безопасность</h3>
+      <div class="sett-group">
+        <label for="setNewPassword">Новый пароль администратора</label>
+        <input type="password" id="setNewPassword" placeholder="Оставьте пустым для сохранения текущего">
+      </div>
+    </div>
   </div>
 
-  <label>Изменить пароль администратора</label>
-  <div style="display:flex;gap:8px;">
-    <input type="password" id="setNewPassword" placeholder="Новый пароль" style="flex:1;">
-    <button class="btn btn-pri" onclick="savePassword()">Изменить</button>
+  <div class="sett-actions">
+    <button class="btn btn-pri" onclick="saveAllSettings()">Сохранить все настройки</button>
+    <span id="setErr" class="sett-msg err-msg"></span>
+    <span id="setOk" class="sett-msg ok-msg"></span>
   </div>
-  
-  <div id="setErr" style="color:#ef4444;font-size:.8rem;margin-top:8px"></div>
-  <div id="setOk" style="color:#22c55e;font-size:.8rem;margin-top:8px"></div>
 </div>
 
 <!-- Модалка добавления/редактирования -->
@@ -492,7 +607,6 @@ function toggleDev(id){
     .catch(()=>{});
 }
 
-// Закрыть по клику на фон
 document.getElementById('modal').addEventListener('click',function(e){if(e.target===this)closeModal();});
 
 function loadConfig() {
@@ -503,6 +617,13 @@ function loadConfig() {
     .then(r => r.json())
     .then(d => {
       document.getElementById('setTempOffset').value = d.tempOffset;
+      document.getElementById('setBatMax').value = d.batMax;
+      document.getElementById('setBatMin').value = d.batMin;
+      document.getElementById('setBatR1').value = d.batR1;
+      document.getElementById('setBatR2').value = d.batR2;
+      document.getElementById('setBatCalib').value = d.batCalib !== undefined ? d.batCalib : 1.0;
+      document.getElementById('setLedWifi').checked = d.ledWifiEn;
+      document.getElementById('setLedTx').checked = d.ledTxEn;
     })
     .catch(() => {});
 }
@@ -512,68 +633,76 @@ function changefontSize(size) {
   document.documentElement.style.fontSize = size + 'px';
 }
 
-function saveTempOffset() {
-  const offsetInput = document.getElementById('setTempOffset');
-  const offset = parseFloat(offsetInput.value);
+function switchTab(tab) {
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+  if (tab === 'devices') {
+    document.getElementById('tab-btn-devices').classList.add('active');
+    document.getElementById('tab-devices').classList.add('active');
+    document.getElementById('btn-add-dev').style.display = 'inline-block';
+  } else {
+    document.getElementById('tab-btn-settings').classList.add('active');
+    document.getElementById('tab-settings').classList.add('active');
+    document.getElementById('btn-add-dev').style.display = 'none';
+  }
+}
+
+function saveAllSettings() {
   const errDiv = document.getElementById('setErr');
   const okDiv = document.getElementById('setOk');
-  
   errDiv.textContent = '';
   okDiv.textContent = '';
   
-  if (isNaN(offset)) {
-    errDiv.textContent = 'Введите корректное число';
+  const offset = parseFloat(document.getElementById('setTempOffset').value);
+  const batMax = parseFloat(document.getElementById('setBatMax').value);
+  const batMin = parseFloat(document.getElementById('setBatMin').value);
+  const batR1 = parseFloat(document.getElementById('setBatR1').value);
+  const batR2 = parseFloat(document.getElementById('setBatR2').value);
+  const batCalib = parseFloat(document.getElementById('setBatCalib').value);
+  const ledWifi = document.getElementById('setLedWifi').checked ? 1 : 0;
+  const ledTx = document.getElementById('setLedTx').checked ? 1 : 0;
+  const pw = document.getElementById('setNewPassword').value.trim();
+  
+  if (isNaN(offset) || isNaN(batMax) || isNaN(batMin) || isNaN(batR1) || isNaN(batR2) || isNaN(batCalib)) {
+    errDiv.textContent = 'Заполните все числовые поля корректно';
     return;
   }
+  
+  const body = `tempOffset=${encodeURIComponent(offset)}&batMax=${encodeURIComponent(batMax)}&batMin=${encodeURIComponent(batMin)}&batR1=${encodeURIComponent(batR1)}&batR2=${encodeURIComponent(batR2)}&batCalib=${encodeURIComponent(batCalib)}&ledWifiEn=${ledWifi}&ledTxEn=${ledTx}`;
   
   fetch('/api/settings/save', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: 'tempOffset=' + encodeURIComponent(offset)
+    body: body
   })
     .then(r => r.json())
     .then(d => {
-      if (d.ok) {
-        okDiv.textContent = 'Настройки сохранены';
+      if (!d.ok) {
+        throw new Error(d.err || 'Ошибка при сохранении настроек');
+      }
+      
+      if (pw) {
+        if (pw.length < 4 || pw.length > 32) {
+          throw new Error('Пароль должен быть от 4 до 32 символов');
+        }
+        return fetch('/api/settings/password', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: 'newPassword=' + encodeURIComponent(pw)
+        }).then(r => r.json()).then(pd => {
+          if (pd.ok) {
+            document.getElementById('setNewPassword').value = '';
+            okDiv.textContent = 'Настройки и новый пароль успешно сохранены';
+          } else {
+            throw new Error(pd.err || 'Ошибка при изменении пароля');
+          }
+        });
       } else {
-        errDiv.textContent = d.err || 'Ошибка при сохранении';
+        okDiv.textContent = 'Настройки успешно сохранены';
       }
     })
-    .catch(() => {
-      errDiv.textContent = 'Ошибка соединения';
-    });
-}
-
-function savePassword() {
-  const pwInput = document.getElementById('setNewPassword');
-  const pw = pwInput.value.trim();
-  const errDiv = document.getElementById('setErr');
-  const okDiv = document.getElementById('setOk');
-  
-  errDiv.textContent = '';
-  okDiv.textContent = '';
-  
-  if (pw.length < 4 || pw.length > 32) {
-    errDiv.textContent = 'Длина пароля должна быть от 4 до 32 символов';
-    return;
-  }
-  
-  fetch('/api/settings/password', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: 'newPassword=' + encodeURIComponent(pw)
-  })
-    .then(r => r.json())
-    .then(d => {
-      if (d.ok) {
-        okDiv.textContent = 'Пароль успешно изменен';
-        pwInput.value = '';
-      } else {
-        errDiv.textContent = d.err || 'Ошибка при сохранении';
-      }
-    })
-    .catch(() => {
-      errDiv.textContent = 'Ошибка соединения';
+    .catch(err => {
+      errDiv.textContent = err.message || 'Ошибка соединения';
     });
 }
 
