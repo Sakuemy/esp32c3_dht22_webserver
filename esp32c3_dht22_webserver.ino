@@ -53,6 +53,14 @@ static int wifiReconnectCount = 0;
 static bool lastDhtReadFailed = false;
 static bool wasConnected = false;
 
+// Переменные актуальности данных DHT и очереди ошибок
+static unsigned long lastDhtSuccessTime = 0;
+static bool dhtSuccessValid = false;
+
+#define MAX_QUEUED_ERRORS 16
+static String errorQueue[MAX_QUEUED_ERRORS];
+static int errorQueueCount = 0;
+
 // Состояние настройки через Serial
 enum SerialState {
   STATE_IDLE,
@@ -80,7 +88,7 @@ static String serialInputBuffer = "";
 // ════════════════════════════════════════════════════════
 #define HISTORY_POINTS  144                 // 24 ч × 6 точек/ч
 #define SLOT_MS         (10UL * 60 * 1000)  // окно 10 мин
-#define DHT_READ_MS     (60UL * 1000)       // опрос DHT раз в 1 мин
+#define DHT_READ_MS     (50UL * 1000)       // опрос DHT раз в 50 сек
 
 // ════════════════════════════════════════════════════════
 //  ▸ УСТРОЙСТВА (хранятся в NVS через Preferences)
@@ -223,6 +231,21 @@ static float curHum  = NAN;
 static SemaphoreHandle_t dataMutex = nullptr;
 #define MUTEX_TAKE()  xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50))
 #define MUTEX_GIVE()  xSemaphoreGive(dataMutex)
+
+static void pushError(const String& err) {
+  if (MUTEX_TAKE() == pdTRUE) {
+    if (errorQueueCount < MAX_QUEUED_ERRORS) {
+      errorQueue[errorQueueCount++] = err;
+    } else {
+      // Сдвигаем влево при переполнении
+      for (int i = 1; i < MAX_QUEUED_ERRORS; i++) {
+        errorQueue[i - 1] = errorQueue[i];
+      }
+      errorQueue[MAX_QUEUED_ERRORS - 1] = err;
+    }
+    MUTEX_GIVE();
+  }
+}
 
 // ════════════════════════════════════════════════════════
 //  ▸ ОБЪЕКТЫ
@@ -383,15 +406,33 @@ static char jsonBuf[JSON_BUF_SIZE];
 } while(0)
 
 static const char* buildApiJson() {
+  static String localErrors[MAX_QUEUED_ERRORS];
+  int localErrorCount = 0;
+
   if (MUTEX_TAKE() != pdTRUE) {
     strncpy(jsonBuf, "{\"error\":\"busy\"}", JSON_BUF_SIZE);
     return jsonBuf;
   }
   float lt = curTemp, lh = curHum;
+  
+  // Проверка актуальности данных за последнюю минуту
+  if (!dhtSuccessValid || (millis() - lastDhtSuccessTime > 60000)) {
+    lt = NAN;
+    lh = NAN;
+  }
+
   time_t nowT; time(&nowT);
   int lHead = historyHead, lCount = historyCount;
   static DataPoint snap[HISTORY_POINTS];
   memcpy(snap, history, sizeof(history));
+
+  // Копируем и очищаем очередь ошибок
+  localErrorCount = errorQueueCount;
+  for (int i = 0; i < localErrorCount; i++) {
+    localErrors[i] = errorQueue[i];
+  }
+  errorQueueCount = 0;
+
   MUTEX_GIVE();
 
   float vBat = filteredBatVolts;
@@ -408,9 +449,17 @@ static const char* buildApiJson() {
 
   char* p = jsonBuf, *end = jsonBuf + JSON_BUF_SIZE - 1;
   unsigned long uptime = millis() / 1000;
-  APPEND_JSON("{\"unixSec\":%lu,\"uptime\":%lu,\"batVolts\":%.2f,\"batLevel\":%d,\"dhtError\":%s,\"wifiRecon\":%d,",
+  APPEND_JSON("{\"unixSec\":%lu,\"uptime\":%lu,\"batVolts\":%.2f,\"batLevel\":%d,\"dhtError\":%s,\"wifiRecon\":%d,\"errors\":[",
               (unsigned long)nowT, uptime, vBat, batLvl,
               lastDhtReadFailed ? "true" : "false", wifiReconnectCount);
+
+  for (int i = 0; i < localErrorCount; i++) {
+    // Внимание: экранируем кавычки в сообщении об ошибке, если они есть
+    String safeMsg = localErrors[i];
+    safeMsg.replace("\"", "\\\"");
+    APPEND_JSON("%s\"%s\"", i == 0 ? "" : ",", safeMsg.c_str());
+  }
+  APPEND_JSON("],");
   if (isnan(lt)) APPEND_JSON("\"temp\":null,");
   else           APPEND_JSON("\"temp\":%.1f,", lt);
   if (isnan(lh)) APPEND_JSON("\"hum\":null,");
@@ -884,6 +933,8 @@ void loop() {
     if (success) {
       t += tempOffset;   // ← калибровка
       lastDhtReadFailed = false;
+      lastDhtSuccessTime = millis();
+      dhtSuccessValid = true;
       if (MUTEX_TAKE() == pdTRUE) {
         curTemp = t;
         curHum  = h;
@@ -892,6 +943,7 @@ void loop() {
       }
     } else {
       lastDhtReadFailed = true;
+      pushError("Ошибка чтения датчика DHT22!");
       Serial.println("[Sensor] Ошибка чтения DHT22: все 3 попытки завершились неудачей");
     }
   }
@@ -940,7 +992,10 @@ void loop() {
       digitalWrite(LED_WIFI, ledWifiEn ? HIGH : LOW);
     }
   } else {
-    wasConnected = false;
+    if (wasConnected) {
+      wasConnected = false;
+      pushError("Потеряно соединение с WiFi!");
+    }
     unsigned long interval = (wifiAttemptCount < 6) ? 10000UL : 60000UL;
     if (lastWifiAttemptTime == 0 || now - lastWifiAttemptTime >= interval) {
       wifiAttemptCount++;

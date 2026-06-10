@@ -89,16 +89,35 @@ function showToast(msg, type = 'error') {
   if (type === 'error') {
     toast.style.background = '#7f1d1d';
     toast.style.border = '1px solid #ef4444';
-    toast.innerHTML = '⚠️ ' + msg;
   } else if (type === 'warning') {
     toast.style.background = '#78350f';
     toast.style.border = '1px solid #f59e0b';
-    toast.innerHTML = '⚠️ ' + msg;
   } else {
     toast.style.background = '#14532d';
     toast.style.border = '1px solid #22c55e';
-    toast.innerHTML = '✅ ' + msg;
   }
+
+  const content = document.createElement('span');
+  content.innerHTML = (type === 'error' || type === 'warning' ? '⚠️ ' : '✅ ') + msg;
+  toast.appendChild(content);
+
+  const closeBtn = document.createElement('span');
+  closeBtn.innerHTML = '&times;';
+  closeBtn.style.cursor = 'pointer';
+  closeBtn.style.marginLeft = '12px';
+  closeBtn.style.fontWeight = 'bold';
+  closeBtn.style.fontSize = '1.2rem';
+  closeBtn.style.lineHeight = '1';
+  closeBtn.style.opacity = '0.7';
+  closeBtn.style.transition = 'opacity 0.2s';
+  closeBtn.onmouseover = () => closeBtn.style.opacity = '1';
+  closeBtn.onmouseout = () => closeBtn.style.opacity = '0.7';
+  closeBtn.onclick = () => {
+    toast.style.opacity = '0';
+    toast.style.transform = 'translateY(-15px)';
+    setTimeout(() => toast.remove(), 300);
+  };
+  toast.appendChild(closeBtn);
   
   container.appendChild(toast);
   setTimeout(() => {
@@ -106,11 +125,13 @@ function showToast(msg, type = 'error') {
     toast.style.transform = 'translateY(0)';
   }, 10);
   
-  setTimeout(() => {
-    toast.style.opacity = '0';
-    toast.style.transform = 'translateY(-15px)';
-    setTimeout(() => toast.remove(), 300);
-  }, 6000);
+  if (type !== 'error') {
+    setTimeout(() => {
+      toast.style.opacity = '0';
+      toast.style.transform = 'translateY(-15px)';
+      setTimeout(() => toast.remove(), 300);
+    }, 6000);
+  }
 }
 
 (function(){
@@ -308,8 +329,8 @@ function poll() {
       failedCount = 0;
       setSt(true);
       tsOff = d.unixSec * 1000 - Date.now();
-      document.getElementById('tV').textContent = d.temp != null ? d.temp.toFixed(1) + ' °C' : '--.- °C';
-      document.getElementById('hV').textContent = d.hum != null ? d.hum.toFixed(1) + ' %' : '--.- %';
+      document.getElementById('tV').textContent = d.temp != null ? d.temp.toFixed(1) + ' °C' : '';
+      document.getElementById('hV').textContent = d.hum != null ? d.hum.toFixed(1) + ' %' : '';
       document.getElementById('uptime').textContent = 'Аптайм: ' + formatUptime(d.uptime);
       
       // Считывание и отрисовка батареи
@@ -335,11 +356,16 @@ function poll() {
         batText.textContent = d.batLevel + '% (' + d.batVolts.toFixed(2) + ' В)';
       }
 
-      // Проверка ошибок чтения DHT22
+      // Проверка ошибок из очереди
+      if (d.errors && Array.isArray(d.errors)) {
+        d.errors.forEach(err => {
+          showToast(err, 'error');
+        });
+      }
+
+      // Проверка восстановления связи с DHT22
       if (d.dhtError !== undefined) {
-        if (d.dhtError && !lastDhtError) {
-          showToast('Ошибка чтения датчика DHT22!', 'error');
-        } else if (!d.dhtError && lastDhtError) {
+        if (!d.dhtError && lastDhtError) {
           showToast('Связь с DHT22 восстановлена', 'success');
         }
         lastDhtError = d.dhtError;
