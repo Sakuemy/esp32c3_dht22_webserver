@@ -375,6 +375,13 @@ static float getBatteryVoltage() {
 #define JSON_BUF_SIZE 6144
 static char jsonBuf[JSON_BUF_SIZE];
 
+// Безопасный макрос для добавления в буфер JSON без риска переполнения
+#define APPEND_JSON(...) do { \
+  int n = snprintf(p, end - p, __VA_ARGS__); \
+  if (n > 0 && n < (end - p)) p += n; \
+  else p = end; \
+} while(0)
+
 static const char* buildApiJson() {
   if (MUTEX_TAKE() != pdTRUE) {
     strncpy(jsonBuf, "{\"error\":\"busy\"}", JSON_BUF_SIZE);
@@ -401,42 +408,42 @@ static const char* buildApiJson() {
 
   char* p = jsonBuf, *end = jsonBuf + JSON_BUF_SIZE - 1;
   unsigned long uptime = millis() / 1000;
-  p += snprintf(p, end-p, "{\"unixSec\":%lu,\"uptime\":%lu,\"batVolts\":%.2f,\"batLevel\":%d,\"dhtError\":%s,\"wifiRecon\":%d,",
-                (unsigned long)nowT, uptime, vBat, batLvl,
-                lastDhtReadFailed ? "true" : "false", wifiReconnectCount);
-  if (isnan(lt)) p += snprintf(p, end-p, "\"temp\":null,");
-  else           p += snprintf(p, end-p, "\"temp\":%.1f,", lt);
-  if (isnan(lh)) p += snprintf(p, end-p, "\"hum\":null,");
-  else           p += snprintf(p, end-p, "\"hum\":%.1f,",  lh);
+  APPEND_JSON("{\"unixSec\":%lu,\"uptime\":%lu,\"batVolts\":%.2f,\"batLevel\":%d,\"dhtError\":%s,\"wifiRecon\":%d,",
+              (unsigned long)nowT, uptime, vBat, batLvl,
+              lastDhtReadFailed ? "true" : "false", wifiReconnectCount);
+  if (isnan(lt)) APPEND_JSON("\"temp\":null,");
+  else           APPEND_JSON("\"temp\":%.1f,", lt);
+  if (isnan(lh)) APPEND_JSON("\"hum\":null,");
+  else           APPEND_JSON("\"hum\":%.1f,",  lh);
 
   int oldest = (lHead - lCount + HISTORY_POINTS) % HISTORY_POINTS;
-  p += snprintf(p, end-p, "\"chart\":{\"times\":[");
+  APPEND_JSON("\"chart\":{\"times\":[");
   bool first = true;
-  for (int i = 0; i < lCount && p < end; i++) {
+  for (int i = 0; i < lCount; i++) {
     int idx = (oldest + i) % HISTORY_POINTS;
     if (!snap[idx].ready) continue;
-    p += snprintf(p, end-p, "%s%lu", first?"":",", (unsigned long)snap[idx].timestamp);
+    APPEND_JSON("%s%lu", first ? "" : ",", (unsigned long)snap[idx].timestamp);
     first = false;
   }
-  p += snprintf(p, end-p, "],\"temp\":[");
+  APPEND_JSON("],\"temp\":[");
   first = true;
-  for (int i = 0; i < lCount && p < end; i++) {
+  for (int i = 0; i < lCount; i++) {
     int idx = (oldest + i) % HISTORY_POINTS;
     if (!snap[idx].ready) continue;
-    p += snprintf(p, end-p, isnan(snap[idx].tempAvg) ? "%snull" : "%s%.1f",
-                  first?"":"," , snap[idx].tempAvg);
+    if (isnan(snap[idx].tempAvg)) APPEND_JSON("%snull", first ? "" : ",");
+    else                          APPEND_JSON("%s%.1f", first ? "" : ",", snap[idx].tempAvg);
     first = false;
   }
-  p += snprintf(p, end-p, "],\"hum\":[");
+  APPEND_JSON("],\"hum\":[");
   first = true;
-  for (int i = 0; i < lCount && p < end; i++) {
+  for (int i = 0; i < lCount; i++) {
     int idx = (oldest + i) % HISTORY_POINTS;
     if (!snap[idx].ready) continue;
-    p += snprintf(p, end-p, isnan(snap[idx].humAvg) ? "%snull" : "%s%.1f",
-                  first?"":"," , snap[idx].humAvg);
+    if (isnan(snap[idx].humAvg)) APPEND_JSON("%snull", first ? "" : ",");
+    else                         APPEND_JSON("%s%.1f", first ? "" : ",", snap[idx].humAvg);
     first = false;
   }
-  snprintf(p, end-p, "]}}");
+  APPEND_JSON("]}}");
   return jsonBuf;
 }
 
@@ -448,7 +455,7 @@ static char devJsonBuf[DEV_JSON_SIZE];
 
 static const char* buildDevicesJson() {
   char* p = devJsonBuf, *end = devJsonBuf + DEV_JSON_SIZE - 1;
-  p += snprintf(p, end-p, "[");
+  APPEND_JSON("[");
   bool first = true;
   for (int i = 0; i < MAX_DEVICES; i++) {
     if (!devices[i].used) continue;
@@ -460,12 +467,12 @@ static const char* buildDevicesJson() {
       safeName[si++] = devices[i].name[k];
     }
     safeName[si] = 0;
-    p += snprintf(p, end-p, "%s{\"id\":%d,\"name\":\"%s\",\"pin\":%d,\"state\":%s}",
-                  first?"":"," , i, safeName, devices[i].pin,
-                  devices[i].state ? "true" : "false");
+    APPEND_JSON("%s{\"id\":%d,\"name\":\"%s\",\"pin\":%d,\"state\":%s}",
+                first ? "" : ",", i, safeName, devices[i].pin,
+                devices[i].state ? "true" : "false");
     first = false;
   }
-  snprintf(p, end-p, "]");
+  APPEND_JSON("]");
   return devJsonBuf;
 }
 
@@ -960,7 +967,9 @@ void loop() {
         serialInputBuffer = "";
       }
     } else {
-      serialInputBuffer += c;
+      if (serialInputBuffer.length() < 128) {
+        serialInputBuffer += c;
+      }
     }
   }
 

@@ -131,7 +131,7 @@ function showToast(msg, type = 'error') {
     const CW=cv.width/DPR,CH=cv.height/DPR;
     ctx.setTransform(DPR,0,0,DPR,0,0);
     ctx.clearRect(0,0,CW,CH);
-    const TMS=data.times,TMP=data.temp,HUM=data.hum,N=TMS.length;
+    const TMS=data.times||[],TMP=data.temp||[],HUM=data.hum||[],N=TMS.length;
     if(N<2){
       ctx.fillStyle='#475569';ctx.font='26px system-ui';ctx.textAlign='center';
       ctx.fillText('Накапливаю данные… (нужно минимум 2 точки)',CW/2,CH/2);
