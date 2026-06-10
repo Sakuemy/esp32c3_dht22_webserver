@@ -913,7 +913,9 @@ void loop() {
 
   // 2. Опрос DHT раз в 1 мин с 3 попытками чтения; применяем TEMP_OFFSET
   static unsigned long lastDht = 0;
-  if (now - lastDht >= DHT_READ_MS) {
+  static bool firstDhtRead = true;
+  if (firstDhtRead || now - lastDht >= DHT_READ_MS) {
+    firstDhtRead = false;
     lastDht = now;
     float t = NAN;
     float h = NAN;
