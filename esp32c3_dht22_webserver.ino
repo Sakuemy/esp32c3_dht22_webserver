@@ -49,6 +49,9 @@ static String wifiPassword = "";
 // Переменные подключения WiFi
 static int wifiAttemptCount = 0;
 static unsigned long lastWifiAttemptTime = 0;
+static int wifiReconnectCount = 0;
+static bool lastDhtReadFailed = false;
+static bool wasConnected = false;
 
 // Состояние настройки через Serial
 enum SerialState {
@@ -66,7 +69,7 @@ static String serialInputBuffer = "";
 // ════════════════════════════════════════════════════════
 //  ▸ ПИНЫ
 // ════════════════════════════════════════════════════════
-#define DHT_PIN     4
+#define DHT_PIN     5
 #define LED_WIFI    12
 #define LED_TX      13
 #define BATTERY_PIN 2
@@ -233,12 +236,15 @@ static bool readDHT22(float &temp, float &hum) {
   digitalWrite(DHT_PIN, LOW);
   delay(20); // Держим линию в LOW 20 мс
   
-  // Переводим пин на INPUT_PULLUP
+  // Переводим пин на INPUT_PULLUP с гарантированным импульсом HIGH для крутого фронта
   digitalWrite(DHT_PIN, HIGH);
+  pinMode(DHT_PIN, OUTPUT);
+  delayMicroseconds(40);
   pinMode(DHT_PIN, INPUT_PULLUP);
+  delayMicroseconds(10);
   
   // Входим в критическую секцию для точного замера длительности импульсов
-  portMUX_TYPE myMutex = portMUX_INITIALIZER_UNLOCKED;
+  static portMUX_TYPE myMutex = portMUX_INITIALIZER_UNLOCKED;
   portENTER_CRITICAL(&myMutex);
   
   // Ожидание ответа датчика (линия должна уйти в LOW, затем в HIGH, затем снова в LOW)
@@ -366,7 +372,7 @@ static float getBatteryVoltage() {
 // ════════════════════════════════════════════════════════
 //  ▸ JSON /api/data  (статический буфер — нет heap alloc)
 // ════════════════════════════════════════════════════════
-#define JSON_BUF_SIZE 4096
+#define JSON_BUF_SIZE 6144
 static char jsonBuf[JSON_BUF_SIZE];
 
 static const char* buildApiJson() {
@@ -395,21 +401,21 @@ static const char* buildApiJson() {
 
   char* p = jsonBuf, *end = jsonBuf + JSON_BUF_SIZE - 1;
   unsigned long uptime = millis() / 1000;
-  p += snprintf(p, end-p, "{\"unixSec\":%lu,\"uptime\":%lu,\"batVolts\":%.2f,\"batLevel\":%d,", (unsigned long)nowT, uptime, vBat, batLvl);
+  p += snprintf(p, end-p, "{\"unixSec\":%lu,\"uptime\":%lu,\"batVolts\":%.2f,\"batLevel\":%d,\"dhtError\":%s,\"wifiRecon\":%d,",
+                (unsigned long)nowT, uptime, vBat, batLvl,
+                lastDhtReadFailed ? "true" : "false", wifiReconnectCount);
   if (isnan(lt)) p += snprintf(p, end-p, "\"temp\":null,");
   else           p += snprintf(p, end-p, "\"temp\":%.1f,", lt);
   if (isnan(lh)) p += snprintf(p, end-p, "\"hum\":null,");
   else           p += snprintf(p, end-p, "\"hum\":%.1f,",  lh);
 
   int oldest = (lHead - lCount + HISTORY_POINTS) % HISTORY_POINTS;
-  p += snprintf(p, end-p, "\"chart\":{\"labels\":[");
+  p += snprintf(p, end-p, "\"chart\":{\"times\":[");
   bool first = true;
   for (int i = 0; i < lCount && p < end; i++) {
     int idx = (oldest + i) % HISTORY_POINTS;
     if (!snap[idx].ready) continue;
-    struct tm* ti = localtime(&snap[idx].timestamp);
-    char tb[6]; strftime(tb, sizeof(tb), "%H:%M", ti);
-    p += snprintf(p, end-p, "%s\"%s\"", first?"":","  , tb);
+    p += snprintf(p, end-p, "%s%lu", first?"":",", (unsigned long)snap[idx].timestamp);
     first = false;
   }
   p += snprintf(p, end-p, "],\"temp\":[");
@@ -504,9 +510,11 @@ void setup() {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("[WiFi] Подключено! IP: %s\n", WiFi.localIP().toString().c_str());
     wifiAttemptCount = 0;
+    wasConnected = true;
   } else {
     Serial.println("[WiFi] Не удалось подключиться. Повтор в фоне.");
     wifiAttemptCount = 1;
+    wasConnected = false;
   }
   lastWifiAttemptTime = millis();
 
@@ -847,14 +855,28 @@ void loop() {
     ledTxOffAt = 0;
   }
 
-  // 2. Опрос DHT раз в 1 мин; применяем TEMP_OFFSET
+  // 2. Опрос DHT раз в 1 мин с 3 попытками чтения; применяем TEMP_OFFSET
   static unsigned long lastDht = 0;
   if (now - lastDht >= DHT_READ_MS) {
     lastDht = now;
     float t = NAN;
     float h = NAN;
-    if (readDHT22(t, h)) {
+    bool success = false;
+    
+    for (int attempt = 1; attempt <= 3; attempt++) {
+      if (readDHT22(t, h)) {
+        success = true;
+        break;
+      }
+      Serial.printf("[Sensor] Попытка %d чтения DHT22 не удалась\n", attempt);
+      if (attempt < 3) {
+        delay(2000); // DHT22 требует минимум 2 сек между опросами
+      }
+    }
+    
+    if (success) {
       t += tempOffset;   // ← калибровка
+      lastDhtReadFailed = false;
       if (MUTEX_TAKE() == pdTRUE) {
         curTemp = t;
         curHum  = h;
@@ -862,7 +884,8 @@ void loop() {
         MUTEX_GIVE();
       }
     } else {
-      Serial.println("[Sensor] Ошибка чтения DHT22");
+      lastDhtReadFailed = true;
+      Serial.println("[Sensor] Ошибка чтения DHT22: все 3 попытки завершились неудачей");
     }
   }
 
@@ -882,20 +905,20 @@ void loop() {
     if (MUTEX_TAKE() == pdTRUE) { closeCurrentSlot(); openNewSlot(t); MUTEX_GIVE(); }
   }
 
-  // 4. Опрос батареи раз в 1 сек (экспоненциальный фильтр)
+  // 4. Опрос батареи раз в 60 сек (фактические данные, без экспоненциального усреднения)
   static unsigned long lastBatteryRead = 0;
-  if (now - lastBatteryRead >= 1000) {
+  if (filteredBatVolts < 0.0f || now - lastBatteryRead >= 60000) {
     lastBatteryRead = now;
-    float rawV = getBatteryVoltage();
-    if (filteredBatVolts < 0.0f) {
-      filteredBatVolts = rawV;
-    } else {
-      filteredBatVolts = filteredBatVolts * 0.9f + rawV * 0.1f;
-    }
+    filteredBatVolts = getBatteryVoltage();
   }
 
   // 5. WiFi Reconnection & status LED
   if (WiFi.status() == WL_CONNECTED) {
+    if (!wasConnected) {
+      wasConnected = true;
+      wifiReconnectCount++;
+      Serial.printf("[WiFi] Реконнект зафиксирован. Всего реконнектов: %d\n", wifiReconnectCount);
+    }
     if (wifiAttemptCount > 0) {
       Serial.println("\n[WiFi] Подключено!");
       Serial.printf("[WiFi] IP: %s\n", WiFi.localIP().toString().c_str());
@@ -910,6 +933,7 @@ void loop() {
       digitalWrite(LED_WIFI, ledWifiEn ? HIGH : LOW);
     }
   } else {
+    wasConnected = false;
     unsigned long interval = (wifiAttemptCount < 6) ? 10000UL : 60000UL;
     if (lastWifiAttemptTime == 0 || now - lastWifiAttemptTime >= interval) {
       wifiAttemptCount++;

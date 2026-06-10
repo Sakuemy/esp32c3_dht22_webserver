@@ -65,11 +65,58 @@ canvas{flex:1;width:100%!important;min-height:0;display:block;cursor:crosshair}
   <canvas id="chart"></canvas>
   <div id="tip"></div>
 </div>
+<!-- Контейнер для всплывающих уведомлений -->
+<div id="toast-container" style="position:fixed;bottom:20px;right:20px;display:flex;flex-direction:column;gap:8px;z-index:9999;pointer-events:none;"></div>
 <script>
+// Функция всплывающих уведомлений
+function showToast(msg, type = 'error') {
+  const container = document.getElementById('toast-container');
+  const toast = document.createElement('div');
+  toast.style.pointerEvents = 'auto';
+  toast.style.padding = '10px 16px';
+  toast.style.borderRadius = '8px';
+  toast.style.fontSize = '0.85rem';
+  toast.style.color = '#fff';
+  toast.style.boxShadow = '0 4px 12px rgba(0,0,0,0.4)';
+  toast.style.display = 'flex';
+  toast.style.alignItems = 'center';
+  toast.style.gap = '8px';
+  toast.style.opacity = '0';
+  toast.style.transform = 'translateY(15px)';
+  toast.style.transition = 'all 0.3s ease';
+  toast.style.fontFamily = 'system-ui, sans-serif';
+  
+  if (type === 'error') {
+    toast.style.background = '#7f1d1d';
+    toast.style.border = '1px solid #ef4444';
+    toast.innerHTML = '⚠️ ' + msg;
+  } else if (type === 'warning') {
+    toast.style.background = '#78350f';
+    toast.style.border = '1px solid #f59e0b';
+    toast.innerHTML = '⚠️ ' + msg;
+  } else {
+    toast.style.background = '#14532d';
+    toast.style.border = '1px solid #22c55e';
+    toast.innerHTML = '✅ ' + msg;
+  }
+  
+  container.appendChild(toast);
+  setTimeout(() => {
+    toast.style.opacity = '1';
+    toast.style.transform = 'translateY(0)';
+  }, 10);
+  
+  setTimeout(() => {
+    toast.style.opacity = '0';
+    toast.style.transform = 'translateY(-15px)';
+    setTimeout(() => toast.remove(), 300);
+  }, 6000);
+}
+
 (function(){
   const cv=document.getElementById('chart'),ctx=cv.getContext('2d'),tip=document.getElementById('tip');
   const DPR=window.devicePixelRatio||1;
-  let data={labels:[],temp:[],hum:[]};
+  let data={times:[],temp:[],hum:[]};
   // Сохраняем параметры последней отрисовки для tooltip
   let lastDraw={PL:0,PR:0,PT:0,PB:0,PW:0,PH:0,N:0,tMn:0,tMx:0,CW:0,CH:0};
 
@@ -84,7 +131,7 @@ canvas{flex:1;width:100%!important;min-height:0;display:block;cursor:crosshair}
     const CW=cv.width/DPR,CH=cv.height/DPR;
     ctx.setTransform(DPR,0,0,DPR,0,0);
     ctx.clearRect(0,0,CW,CH);
-    const LBL=data.labels,TMP=data.temp,HUM=data.hum,N=LBL.length;
+    const TMS=data.times,TMP=data.temp,HUM=data.hum,N=TMS.length;
     if(N<2){
       ctx.fillStyle='#475569';ctx.font='26px system-ui';ctx.textAlign='center';
       ctx.fillText('Накапливаю данные… (нужно минимум 2 точки)',CW/2,CH/2);
@@ -121,12 +168,17 @@ canvas{flex:1;width:100%!important;min-height:0;display:block;cursor:crosshair}
       ctx.fillText(v.toFixed(0)+'%',PL+PW+7,PT+(g/4)*PH+7);
     }
 
+    const formatTime=ts=>{
+      const d=new Date(ts*1000);
+      return p2(d.getHours())+':'+p2(d.getMinutes());
+    };
+
     // Метки X
     ctx.fillStyle='#64748b';ctx.textAlign='center';ctx.font='20px system-ui';
     const st=Math.max(1,Math.floor(N/6));
     const shown=new Set();
-    for(let i=0;i<N;i+=st){ctx.fillText(LBL[i],xOf(i),PT+PH+26);shown.add(i);}
-    if(!shown.has(N-1))ctx.fillText(LBL[N-1],xOf(N-1),PT+PH+26);
+    for(let i=0;i<N;i+=st){ctx.fillText(formatTime(TMS[i]),xOf(i),PT+PH+26);shown.add(i);}
+    if(!shown.has(N-1))ctx.fillText(formatTime(TMS[N-1]),xOf(N-1),PT+PH+26);
 
     // Линия температуры
     ctx.strokeStyle='#fb923c';ctx.lineWidth=2.5;ctx.lineJoin='round';
@@ -146,6 +198,20 @@ canvas{flex:1;width:100%!important;min-height:0;display:block;cursor:crosshair}
     }
     ctx.stroke();
 
+    // Точки на кривой температуры (полые круги)
+    for(let i=0;i<N;i++){
+      if(TMP[i]===null||isNaN(TMP[i]))continue;
+      ctx.beginPath();ctx.arc(xOf(i),yT(TMP[i]),4.5,0,2*Math.PI);ctx.fillStyle='#fb923c';ctx.fill();
+      ctx.beginPath();ctx.arc(xOf(i),yT(TMP[i]),2.5,0,2*Math.PI);ctx.fillStyle='#1e293b';ctx.fill();
+    }
+
+    // Точки на кривой влажности (полые круги)
+    for(let i=0;i<N;i++){
+      if(HUM[i]===null||isNaN(HUM[i]))continue;
+      ctx.beginPath();ctx.arc(xOf(i),yH(HUM[i]),4.5,0,2*Math.PI);ctx.fillStyle='#38bdf8';ctx.fill();
+      ctx.beginPath();ctx.arc(xOf(i),yH(HUM[i]),2.5,0,2*Math.PI);ctx.fillStyle='#1e293b';ctx.fill();
+    }
+
     // Легенда
     const lx=PL,ly=CH-12;
     ctx.lineWidth=2.5;
@@ -157,7 +223,7 @@ canvas{flex:1;width:100%!important;min-height:0;display:block;cursor:crosshair}
 
   // ── Tooltip при наведении ──────────────────────────────
   cv.addEventListener('mousemove',function(e){
-    const {PL,PW,PT,PH,N,tMn,tMx}=lastDraw;
+    const {PL,PW,PT,PH,N}=lastDraw;
     if(N<2){tip.style.display='none';return;}
     const rect=cv.getBoundingClientRect();
     const mx=e.clientX-rect.left;
@@ -167,10 +233,15 @@ canvas{flex:1;width:100%!important;min-height:0;display:block;cursor:crosshair}
     if(frac<0||frac>1){tip.style.display='none';return;}
     const idx=Math.round(frac*(N-1));
     if(idx<0||idx>=N){tip.style.display='none';return;}
-    const T=data.temp[idx],H=data.hum[idx];
+    const T=data.temp[idx],H=data.hum[idx],ts=data.times[idx];
     const tStr=T!==null&&!isNaN(T)?T.toFixed(1)+' °C':'—';
     const hStr=H!==null&&!isNaN(H)?H.toFixed(1)+' %':'—';
-    tip.innerHTML='<b>'+data.labels[idx]+'</b><br>🌡 '+tStr+'<br>💧 '+hStr;
+    
+    const d=new Date(ts*1000);
+    const dateStr=p2(d.getDate())+'.'+p2(d.getMonth()+1)+'.'+d.getFullYear();
+    const timeStr=p2(d.getHours())+':'+p2(d.getMinutes());
+    
+    tip.innerHTML='<b>'+dateStr+' '+timeStr+'</b><br>🌡 '+tStr+'<br>💧 '+hStr;
     // Позиционируем tooltip рядом с курсором, не выходя за края
     const bw=tip.offsetWidth||110,bh=tip.offsetHeight||60;
     const cw=rect.width,ch=rect.height;
@@ -218,6 +289,10 @@ function formatUptime(sec) {
   return res;
 }
 
+// Переменные состояния для уведомлений
+let lastDhtError = false;
+let lastWifiReconCount = null;
+
 // Polling с таймаутом и 3 попытками
 let failedCount = 0;
 let pollTmr = null;
@@ -258,6 +333,24 @@ function poll() {
           batFill.setAttribute('fill', '#ef4444');
         }
         batText.textContent = d.batLevel + '% (' + d.batVolts.toFixed(2) + ' В)';
+      }
+
+      // Проверка ошибок чтения DHT22
+      if (d.dhtError !== undefined) {
+        if (d.dhtError && !lastDhtError) {
+          showToast('Ошибка чтения датчика DHT22!', 'error');
+        } else if (!d.dhtError && lastDhtError) {
+          showToast('Связь с DHT22 восстановлена', 'success');
+        }
+        lastDhtError = d.dhtError;
+      }
+
+      // Проверка реконнектов WiFi
+      if (d.wifiRecon !== undefined) {
+        if (lastWifiReconCount !== null && d.wifiRecon > lastWifiReconCount) {
+          showToast(`Зафиксировано переподключение к WiFi (всего: ${d.wifiRecon})`, 'warning');
+        }
+        lastWifiReconCount = d.wifiRecon;
       }
 
       window._chartUpdate(d.chart);
