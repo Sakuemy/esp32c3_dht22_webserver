@@ -86,7 +86,7 @@ static String serialInputBuffer = "";
 // ════════════════════════════════════════════════════════
 //  ▸ ПАРАМЕТРЫ ИСТОРИИ
 // ════════════════════════════════════════════════════════
-#define HISTORY_POINTS  144                 // 24 ч × 6 точек/ч
+#define HISTORY_POINTS  1008                 // 24 ч × 6 точек/ч
 #define SLOT_MS         (10UL * 60 * 1000)  // окно 10 мин
 #define DHT_READ_MS     (50UL * 1000)       // опрос DHT раз в 50 сек
 
@@ -272,9 +272,9 @@ static bool readDHT22(float &temp, float &hum) {
   
   // Ожидание ответа датчика (линия должна уйти в LOW, затем в HIGH, затем снова в LOW)
   #define WaitPin(level, timeout_us) { \
-    uint32_t start = esp_timer_get_time(); \
+    int64_t start = esp_timer_get_time(); \
     while (gpio_get_level((gpio_num_t)DHT_PIN) == level) { \
-      if ((esp_timer_get_time() - start) > timeout_us) { \
+        if ((esp_timer_get_time() - start) > timeout_us) { \
         portEXIT_CRITICAL(&myMutex); \
         return false; \
       } \
@@ -294,10 +294,10 @@ static bool readDHT22(float &temp, float &hum) {
     WaitPin(LOW, 100);
     
     // Линия ушла в HIGH. Засекаем время
-    uint32_t startHigh = esp_timer_get_time();
+    uint64_t startHigh = esp_timer_get_time();
     // Ждем окончания высокого уровня
     WaitPin(HIGH, 100);
-    uint32_t duration = esp_timer_get_time() - startHigh;
+    uint64_t duration = esp_timer_get_time() - startHigh;
     
     int byteIdx = i / 8;
     data[byteIdx] <<= 1;
@@ -906,7 +906,7 @@ void loop() {
   const unsigned long now = millis();
 
   // 1. LED TX
-  if (ledTxOffAt > 0 && now >= ledTxOffAt) {
+  if (ledTxOffAt > 0 && now - ledTxOffAt < 1000UL) {
     digitalWrite(LED_TX, LOW);
     ledTxOffAt = 0;
   }
