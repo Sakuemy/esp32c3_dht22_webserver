@@ -2,7 +2,7 @@
  * ESP32-C3 | DHT22 + Web Server + NTP + LED + Admin Panel
  *
  * Пины по умолчанию:
- *   GPIO4  — DHT22 data
+ *   GPIO5  — DHT22 data
  *   GPIO12 — LED WiFi (горит при подключении)
  *   GPIO13 — LED TX  (моргает при HTTP-запросе)
  *
@@ -28,7 +28,7 @@
 // ════════════════════════════════════════════════════════
 //  ▸ НАСТРОЙКИ — измените под свою сеть
 // ════════════════════════════════════════════════════════
-static String adminPassword     = "admin123";   // пароль личного кабинета
+static char adminPassword[33]   = "admin123";   // пароль личного кабинета
 const long  GMT_OFFSET_SEC      = 3 * 3600;     // UTC+3 (Москва)
 const int   DAYLIGHT_OFFSET_SEC = 0;
 
@@ -43,8 +43,8 @@ static float batCalib = 1.0f;        // калибровочный коэффи�
 static bool ledWifiEn = true;
 static bool ledTxEn = true;
 
-static String wifiSSID = "";
-static String wifiPassword = "";
+static char wifiSSID[65]     = "";
+static char wifiPassword[65] = "";
 
 // Переменные подключения WiFi
 static int wifiAttemptCount = 0;
@@ -53,12 +53,24 @@ static int wifiReconnectCount = 0;
 static bool lastDhtReadFailed = false;
 static bool wasConnected = false;
 
+// ── Хардовый реинит WiFi-стека ──────────────────────────
+// Если соединение не восстанавливается дольше WIFI_HARD_REINIT_MS,
+// выполняется WiFi.disconnect(true) + WiFi.begin() — полный сброс стека.
+#define WIFI_HARD_REINIT_MS  (5UL * 60 * 1000)   // 5 минут без связи
+#define WIFI_HARD_REINIT_INTERVAL_MS (2UL * 60 * 1000) // не чаще раза в 2 мин
+
+static unsigned long wifiDisconnectedSince  = 0;   // millis() момента потери связи
+static unsigned long lastHardReinitTime     = 0;   // millis() последнего хард-реинита
+static int           hardReinitCount        = 0;   // статистика
+// ────────────────────────────────────────────────────────
+
 // Переменные актуальности данных DHT и очереди ошибок
 static unsigned long lastDhtSuccessTime = 0;
 static bool dhtSuccessValid = false;
 
 #define MAX_QUEUED_ERRORS 16
-static String errorQueue[MAX_QUEUED_ERRORS];
+#define ERROR_MSG_LEN     128
+static char errorQueue[MAX_QUEUED_ERRORS][ERROR_MSG_LEN];
 static int errorQueueCount = 0;
 
 // Состояние настройки через Serial
@@ -69,10 +81,10 @@ enum SerialState {
   STATE_ADMIN_PASS
 };
 static SerialState serialState = STATE_IDLE;
-static String newSsid = "";
-static String newPass = "";
+static char newSsid[65]          = "";
+static char newPass[65]          = "";
 static unsigned long lastSerialTime = 0;
-static String serialInputBuffer = "";
+static char serialInputBuffer[129] = "";
 
 // ════════════════════════════════════════════════════════
 //  ▸ ПИНЫ
@@ -152,9 +164,13 @@ void deleteDeviceFromNVS(int idx) {
 void loadSettings() {
   prefs.begin("settings", true);
   tempOffset = prefs.getFloat("tempOffset", 0.0f);
-  adminPassword = prefs.getString("adminPw", "admin123");
-  wifiSSID = prefs.getString("wifiSSID", WIFI_SSID);
-  wifiPassword = prefs.getString("wifiPW", WIFI_PASSWORD);
+  // Читаем строки как байты; если ключа нет — оставляем дефолт
+  if (prefs.isKey("adminPw")) prefs.getBytes("adminPw", adminPassword, sizeof(adminPassword));
+  else strncpy(adminPassword, "admin123", sizeof(adminPassword) - 1);
+  if (prefs.isKey("wifiSSID")) prefs.getBytes("wifiSSID", wifiSSID, sizeof(wifiSSID));
+  else strncpy(wifiSSID, WIFI_SSID, sizeof(wifiSSID) - 1);
+  if (prefs.isKey("wifiPW"))   prefs.getBytes("wifiPW",   wifiPassword, sizeof(wifiPassword));
+  else strncpy(wifiPassword, WIFI_PASSWORD, sizeof(wifiPassword) - 1);
   batMax   = prefs.getFloat("batMax",   4.2f);
   batMin   = prefs.getFloat("batMin",   3.0f);
   batR1    = prefs.getFloat("batR1",    230000.0f);
@@ -168,9 +184,9 @@ void loadSettings() {
 void saveSettings() {
   prefs.begin("settings", false);
   prefs.putFloat("tempOffset", tempOffset);
-  prefs.putString("adminPw", adminPassword);
-  prefs.putString("wifiSSID", wifiSSID);
-  prefs.putString("wifiPW", wifiPassword);
+  prefs.putBytes("adminPw",  adminPassword, strlen(adminPassword) + 1);
+  prefs.putBytes("wifiSSID", wifiSSID,      strlen(wifiSSID)      + 1);
+  prefs.putBytes("wifiPW",   wifiPassword,  strlen(wifiPassword)  + 1);
   prefs.putFloat("batMax",   batMax);
   prefs.putFloat("batMin",   batMin);
   prefs.putFloat("batR1",    batR1);
@@ -199,9 +215,11 @@ static void generateToken() {
 static bool isAuthorized(AsyncWebServerRequest* req) {
   if (sessionToken[0] == 0) return false;
   if (!req->hasHeader("Cookie")) return false;
-  String cookies = req->header("Cookie");
-  String needle  = String("esp_sess=") + sessionToken;
-  return cookies.indexOf(needle) >= 0;
+  // Сравниваем без heap-аллокаций: ищем подстроку "esp_sess=<token>" в заголовке Cookie
+  const String& cookies = req->header("Cookie");
+  char needle[64];
+  snprintf(needle, sizeof(needle), "esp_sess=%s", sessionToken);
+  return strstr(cookies.c_str(), needle) != nullptr;
 }
 
 // ════════════════════════════════════════════════════════
@@ -229,19 +247,35 @@ static float curHum  = NAN;
 //  ▸ МЬЮТЕКС (защита history/curTemp/curHum)
 // ════════════════════════════════════════════════════════
 static SemaphoreHandle_t dataMutex = nullptr;
-#define MUTEX_TAKE()  xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50))
+static volatile uint32_t mutexTimeoutCount = 0;
+
+static inline BaseType_t mutexTake() {
+  BaseType_t r = xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50));
+  if (r != pdTRUE) {
+    mutexTimeoutCount++;
+    // Serial потокобезопасен на ESP32 — логируем без мьютекса
+    Serial.printf("[MUTEX] TIMEOUT #%lu ctx=%s\n",
+                  (unsigned long)mutexTimeoutCount,
+                  pcTaskGetName(nullptr));
+  }
+  return r;
+}
+#define MUTEX_TAKE()  mutexTake()
 #define MUTEX_GIVE()  xSemaphoreGive(dataMutex)
 
-static void pushError(const String& err) {
+static void pushError(const char* err) {
   if (MUTEX_TAKE() == pdTRUE) {
     if (errorQueueCount < MAX_QUEUED_ERRORS) {
-      errorQueue[errorQueueCount++] = err;
+      strncpy(errorQueue[errorQueueCount], err, ERROR_MSG_LEN - 1);
+      errorQueue[errorQueueCount][ERROR_MSG_LEN - 1] = 0;
+      errorQueueCount++;
     } else {
       // Сдвигаем влево при переполнении
       for (int i = 1; i < MAX_QUEUED_ERRORS; i++) {
-        errorQueue[i - 1] = errorQueue[i];
+        memcpy(errorQueue[i - 1], errorQueue[i], ERROR_MSG_LEN);
       }
-      errorQueue[MAX_QUEUED_ERRORS - 1] = err;
+      strncpy(errorQueue[MAX_QUEUED_ERRORS - 1], err, ERROR_MSG_LEN - 1);
+      errorQueue[MAX_QUEUED_ERRORS - 1][ERROR_MSG_LEN - 1] = 0;
     }
     MUTEX_GIVE();
   }
@@ -259,9 +293,9 @@ static bool readDHT22(float &temp, float &hum) {
   digitalWrite(DHT_PIN, LOW);
   delay(20); // Держим линию в LOW 20 мс
   
-  // Переводим пин на INPUT_PULLUP с гарантированным импульсом HIGH для крутого фронта
-  digitalWrite(DHT_PIN, HIGH);
+  // Переводим пин на OUTPUT HIGH для крутого фронта, затем INPUT_PULLUP
   pinMode(DHT_PIN, OUTPUT);
+  digitalWrite(DHT_PIN, HIGH);
   delayMicroseconds(40);
   pinMode(DHT_PIN, INPUT_PULLUP);
   delayMicroseconds(10);
@@ -406,7 +440,7 @@ static char jsonBuf[JSON_BUF_SIZE];
 } while(0)
 
 static const char* buildApiJson() {
-  static String localErrors[MAX_QUEUED_ERRORS];
+  static char localErrors[MAX_QUEUED_ERRORS][ERROR_MSG_LEN];
   int localErrorCount = 0;
 
   if (MUTEX_TAKE() != pdTRUE) {
@@ -414,6 +448,7 @@ static const char* buildApiJson() {
     return jsonBuf;
   }
   float lt = curTemp, lh = curHum;
+  float vBatSnap = filteredBatVolts;  // снимок под мьютексом — защита от гонки с loop()
   
   // Проверка актуальности данных за последнюю минуту
   if (!dhtSuccessValid || (millis() - lastDhtSuccessTime > 60000)) {
@@ -429,13 +464,13 @@ static const char* buildApiJson() {
   // Копируем и очищаем очередь ошибок
   localErrorCount = errorQueueCount;
   for (int i = 0; i < localErrorCount; i++) {
-    localErrors[i] = errorQueue[i];
+    memcpy(localErrors[i], errorQueue[i], ERROR_MSG_LEN);
   }
   errorQueueCount = 0;
 
   MUTEX_GIVE();
 
-  float vBat = filteredBatVolts;
+  float vBat = vBatSnap;
   int batLvl = -1;
   if (vBat >= 0.5f) {
     if (vBat >= batMax) {
@@ -449,15 +484,21 @@ static const char* buildApiJson() {
 
   char* p = jsonBuf, *end = jsonBuf + JSON_BUF_SIZE - 1;
   unsigned long uptime = millis() / 1000;
-  APPEND_JSON("{\"unixSec\":%lu,\"uptime\":%lu,\"batVolts\":%.2f,\"batLevel\":%d,\"dhtError\":%s,\"wifiRecon\":%d,\"errors\":[",
+  APPEND_JSON("{\"unixSec\":%lu,\"uptime\":%lu,\"batVolts\":%.2f,\"batLevel\":%d,\"dhtError\":%s,\"wifiRecon\":%d,\"mutexTO\":%lu,\"errors\":[",
               (unsigned long)nowT, uptime, vBat, batLvl,
-              lastDhtReadFailed ? "true" : "false", wifiReconnectCount);
+              lastDhtReadFailed ? "true" : "false", wifiReconnectCount,
+              (unsigned long)mutexTimeoutCount);
 
   for (int i = 0; i < localErrorCount; i++) {
-    // Внимание: экранируем кавычки в сообщении об ошибке, если они есть
-    String safeMsg = localErrors[i];
-    safeMsg.replace("\"", "\\\"");
-    APPEND_JSON("%s\"%s\"", i == 0 ? "" : ",", safeMsg.c_str());
+    // Экранируем кавычки в сообщении об ошибке без heap-аллокаций
+    char escaped[ERROR_MSG_LEN * 2];
+    int ei = 0;
+    for (int k = 0; localErrors[i][k] && ei < (int)sizeof(escaped) - 2; k++) {
+      if (localErrors[i][k] == '"' || localErrors[i][k] == '\\') escaped[ei++] = '\\';
+      escaped[ei++] = localErrors[i][k];
+    }
+    escaped[ei] = 0;
+    APPEND_JSON("%s\"%s\"", i == 0 ? "" : ",", escaped);
   }
   APPEND_JSON("],");
   if (isnan(lt)) APPEND_JSON("\"temp\":null,");
@@ -499,26 +540,36 @@ static const char* buildApiJson() {
 // ════════════════════════════════════════════════════════
 //  ▸ JSON /api/devices
 // ════════════════════════════════════════════════════════
-#define DEV_JSON_SIZE 1024
+#define DEV_JSON_SIZE 2048
 static char devJsonBuf[DEV_JSON_SIZE];
 
 static const char* buildDevicesJson() {
+  // Снимок devices[] под мьютексом — защита от гонки с async_tcp задачей
+  static Device snapDevices[MAX_DEVICES];
+  if (MUTEX_TAKE() == pdTRUE) {
+    memcpy(snapDevices, devices, sizeof(devices));
+    MUTEX_GIVE();
+  } else {
+    strncpy(devJsonBuf, "[]", DEV_JSON_SIZE);
+    return devJsonBuf;
+  }
+
   char* p = devJsonBuf, *end = devJsonBuf + DEV_JSON_SIZE - 1;
   APPEND_JSON("[");
   bool first = true;
   for (int i = 0; i < MAX_DEVICES; i++) {
-    if (!devices[i].used) continue;
+    if (!snapDevices[i].used) continue;
     // Экранируем имя: заменяем " на \"
     char safeName[DEV_NAME_LEN * 2];
     int si = 0;
-    for (int k = 0; devices[i].name[k] && si < (int)sizeof(safeName)-2; k++) {
-      if (devices[i].name[k] == '"') safeName[si++] = '\\';
-      safeName[si++] = devices[i].name[k];
+    for (int k = 0; snapDevices[i].name[k] && si < (int)sizeof(safeName)-2; k++) {
+      if (snapDevices[i].name[k] == '"') safeName[si++] = '\\';
+      safeName[si++] = snapDevices[i].name[k];
     }
     safeName[si] = 0;
     APPEND_JSON("%s{\"id\":%d,\"name\":\"%s\",\"pin\":%d,\"state\":%s}",
-                first ? "" : ",", i, safeName, devices[i].pin,
-                devices[i].state ? "true" : "false");
+                first ? "" : ",", i, safeName, snapDevices[i].pin,
+                snapDevices[i].state ? "true" : "false");
     first = false;
   }
   APPEND_JSON("]");
@@ -555,8 +606,8 @@ void setup() {
   // WiFi — один WiFi.begin(), ждём до 20 сек
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(false);
-  Serial.printf("[WiFi] Подключение к: %s\n", wifiSSID.c_str());
-  WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
+  Serial.printf("[WiFi] Подключение к: %s\n", wifiSSID);
+  WiFi.begin(wifiSSID, wifiPassword);
   {
     unsigned long t0 = millis();
     while (millis() - t0 < 20000 && WiFi.status() != WL_CONNECTED) {
@@ -603,11 +654,12 @@ void setup() {
   server.on("/api/login", HTTP_POST, [](AsyncWebServerRequest* req) {
     blinkTx();
     if (req->hasParam("pw", true)) {
-      String pw = req->getParam("pw", true)->value();
+      const String& pw = req->getParam("pw", true)->value();
       if (pw == adminPassword) {
         generateToken();
         AsyncWebServerResponse* resp = req->beginResponse(200, "application/json", "{\"ok\":true}");
-        String cookie = String("esp_sess=") + sessionToken + "; Path=/; HttpOnly";
+        char cookie[80];
+        snprintf(cookie, sizeof(cookie), "esp_sess=%s; Path=/; HttpOnly", sessionToken);
         resp->addHeader("Set-Cookie", cookie);
         req->send(resp);
         return;
@@ -651,12 +703,12 @@ void setup() {
     }
 
     int    id    = req->hasParam("id",true) ? req->getParam("id",true)->value().toInt() : -1;
-    String name  = req->getParam("name",true)->value();
+    const String& nameStr = req->getParam("name",true)->value();
     int    pin   = req->getParam("pin",true)->value().toInt();
     bool   state = req->getParam("state",true)->value().toInt() != 0;
 
     // Валидация
-    if (name.length() == 0 || name.length() > 31) {
+    if (nameStr.length() == 0 || nameStr.length() > 31) {
       req->send(200, "application/json", "{\"ok\":false,\"err\":\"invalid name\"}"); return;
     }
     if (pin < 0 || pin > 21) {
@@ -687,7 +739,7 @@ void setup() {
       }
     }
 
-    strncpy(devices[slot].name, name.c_str(), DEV_NAME_LEN - 1);
+    strncpy(devices[slot].name, nameStr.c_str(), DEV_NAME_LEN - 1);
     devices[slot].name[DEV_NAME_LEN - 1] = 0;
     devices[slot].pin   = (uint8_t)pin;
     devices[slot].state = state;
@@ -793,13 +845,18 @@ void setup() {
     blinkTx();
     if (!isAuthorized(req)) { req->send(403, "application/json", "{\"error\":\"forbidden\"}"); return; }
     if (req->hasParam("newPassword", true)) {
-      String newPw = req->getParam("newPassword", true)->value();
-      newPw.trim();
-      if (newPw.length() < 4 || newPw.length() > 32) {
+      const String& newPwStr = req->getParam("newPassword", true)->value();
+      // trim: находим начало и конец без пробелов (без heap-аллокации)
+      int pStart = 0, pEnd = (int)newPwStr.length() - 1;
+      while (pStart <= pEnd && newPwStr[pStart] == ' ') pStart++;
+      while (pEnd >= pStart && newPwStr[pEnd] == ' ')  pEnd--;
+      int pLen = pEnd - pStart + 1;
+      if (pLen < 4 || pLen > 32) {
         req->send(200, "application/json", "{\"ok\":false,\"err\":\"Длина пароля должна быть от 4 до 32 символов\"}");
         return;
       }
-      adminPassword = newPw;
+      strncpy(adminPassword, newPwStr.c_str() + pStart, pLen);
+      adminPassword[pLen] = 0;
       saveSettings();
       req->send(200, "application/json", "{\"ok\":true}");
     } else {
@@ -833,31 +890,40 @@ void setup() {
   Serial.println("[HTTP] Сервер запущен.");
 }
 
-static void processSerialCommand(String cmd) {
-  cmd.trim();
-  if (cmd.length() == 0) return;
-  
+static void processSerialCommand(char* cmd) {
+  // trim in-place
+  int len = strlen(cmd);
+  while (len > 0 && (cmd[len-1] == ' ' || cmd[len-1] == '\r' || cmd[len-1] == '\n')) cmd[--len] = 0;
+  char* start = cmd;
+  while (*start == ' ') start++;
+  if (*start == 0) return;
+
   if (serialState == STATE_IDLE) {
-    if (cmd.equalsIgnoreCase("help")) {
+    if (strcasecmp(start, "help") == 0) {
       Serial.println("\n=== Доступные команды ===");
       Serial.println("  wifi     - Настройка подключения к WiFi");
       Serial.println("  password - Изменение пароля администратора");
       Serial.println("  status   - Текущий статус системы");
       Serial.println("  help     - Показать это сообщение");
-    } else if (cmd.equalsIgnoreCase("wifi")) {
+    } else if (strcasecmp(start, "wifi") == 0) {
       Serial.println("\n[WiFi] Введите SSID сети:");
       serialState = STATE_WIFI_SSID;
-    } else if (cmd.equalsIgnoreCase("password")) {
+    } else if (strcasecmp(start, "password") == 0) {
       Serial.println("\n[Admin] Введите новый пароль администратора (от 4 до 32 символов):");
       serialState = STATE_ADMIN_PASS;
-    } else if (cmd.equalsIgnoreCase("status")) {
+    } else if (strcasecmp(start, "status") == 0) {
       Serial.println("\n=== Статус системы ===");
       Serial.printf("  WiFi SSID: %s\n", WiFi.SSID().c_str());
       Serial.printf("  IP адрес: %s\n", WiFi.localIP().toString().c_str());
       Serial.printf("  WiFi статус: %s\n", WiFi.status() == WL_CONNECTED ? "Подключен" : "Отключен");
+      Serial.printf("  Реконнектов: %d, хард-реинитов: %d\n", wifiReconnectCount, hardReinitCount);
+      Serial.printf("  Таймаутов мьютекса: %lu\n", (unsigned long)mutexTimeoutCount);
+      if (WiFi.status() != WL_CONNECTED && wifiDisconnectedSince > 0) {
+        Serial.printf("  Нет связи: %lu сек\n", (millis() - wifiDisconnectedSince) / 1000UL);
+      }
       Serial.printf("  Температура: %.1f °C\n", curTemp);
       Serial.printf("  Влажность: %.1f %%\n", curHum);
-      float vBat = filteredBatVolts;
+      float vBat = filteredBatVolts;  // читаем из основного потока, гонки нет
       if (vBat >= 0.5f) {
         Serial.printf("  Батарея: %.2f В\n", vBat);
       } else {
@@ -867,31 +933,35 @@ static void processSerialCommand(String cmd) {
       Serial.println("Неизвестная команда. Введите 'help' для списка команд.");
     }
   } else if (serialState == STATE_WIFI_SSID) {
-    newSsid = cmd;
+    strncpy(newSsid, start, sizeof(newSsid) - 1);
+    newSsid[sizeof(newSsid) - 1] = 0;
     Serial.println("[WiFi] Введите пароль сети:");
     serialState = STATE_WIFI_PASS;
   } else if (serialState == STATE_WIFI_PASS) {
-    newPass = cmd;
-    Serial.printf("[WiFi] Подключение к '%s' с паролем '%s'...\n", newSsid.c_str(), newPass.c_str());
-    
-    wifiSSID = newSsid;
-    wifiPassword = newPass;
+    strncpy(newPass, start, sizeof(newPass) - 1);
+    newPass[sizeof(newPass) - 1] = 0;
+    Serial.printf("[WiFi] Подключение к '%s' с паролем '%s'...\n", newSsid, newPass);
+
+    strncpy(wifiSSID,     newSsid, sizeof(wifiSSID)     - 1); wifiSSID[sizeof(wifiSSID)-1] = 0;
+    strncpy(wifiPassword, newPass, sizeof(wifiPassword) - 1); wifiPassword[sizeof(wifiPassword)-1] = 0;
     saveSettings();
-    
+
     // Переподключаемся
     WiFi.disconnect();
-    WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
-    
+    WiFi.begin(wifiSSID, wifiPassword);
+
     // Сбрасываем счетчик попыток подключения
     wifiAttemptCount = 1;
     lastWifiAttemptTime = millis();
-    
+
     serialState = STATE_IDLE;
   } else if (serialState == STATE_ADMIN_PASS) {
-    if (cmd.length() < 4 || cmd.length() > 32) {
+    int plen = strlen(start);
+    if (plen < 4 || plen > 32) {
       Serial.println("[Ошибка] Пароль должен быть от 4 до 32 символов. Введите заново:");
     } else {
-      adminPassword = cmd;
+      strncpy(adminPassword, start, sizeof(adminPassword) - 1);
+      adminPassword[sizeof(adminPassword) - 1] = 0;
       saveSettings();
       Serial.println("[Admin] Пароль администратора успешно изменен!");
       serialState = STATE_IDLE;
@@ -906,7 +976,7 @@ void loop() {
   const unsigned long now = millis();
 
   // 1. LED TX
-  if (ledTxOffAt > 0 && now - ledTxOffAt < 1000UL) {
+  if (ledTxOffAt > 0 && now >= ledTxOffAt) {
     digitalWrite(LED_TX, LOW);
     ledTxOffAt = 0;
   }
@@ -928,7 +998,11 @@ void loop() {
       }
       Serial.printf("[Sensor] Попытка %d чтения DHT22 не удалась\n", attempt);
       if (attempt < 3) {
-        delay(2000); // DHT22 требует минимум 2 сек между опросами
+        // Неблокирующая пауза 2 с: уступаем CPU, не блокируем TWDT
+        unsigned long pauseStart = millis();
+        while (millis() - pauseStart < 2000UL) {
+          delay(1);
+        }
       }
     }
     
@@ -966,15 +1040,23 @@ void loop() {
     if (MUTEX_TAKE() == pdTRUE) { closeCurrentSlot(); openNewSlot(t); MUTEX_GIVE(); }
   }
 
-  // 4. Опрос батареи раз в 60 сек (фактические данные, без экспоненциального усреднения)
+  // 4. Опрос батареи раз в 60 сек
   static unsigned long lastBatteryRead = 0;
   if (filteredBatVolts < 0.0f || now - lastBatteryRead >= 60000) {
     lastBatteryRead = now;
-    filteredBatVolts = getBatteryVoltage();
+    float v = getBatteryVoltage();
+    // Атомарно обновляем под мьютексом, чтобы исключить гонку с HTTP-задачей
+    if (MUTEX_TAKE() == pdTRUE) {
+      filteredBatVolts = v;
+      MUTEX_GIVE();
+    }
   }
 
   // 5. WiFi Reconnection & status LED
   if (WiFi.status() == WL_CONNECTED) {
+    // Сбрасываем таймер отключения при успешном коннекте
+    wifiDisconnectedSince = 0;
+
     if (!wasConnected) {
       wasConnected = true;
       wifiReconnectCount++;
@@ -986,7 +1068,7 @@ void loop() {
       wifiAttemptCount = 0;
       lastWifiAttemptTime = 0;
     }
-    
+
     // LED WiFi (if enabled)
     static unsigned long lastLed = 0;
     if (now - lastLed >= 1000) {
@@ -994,19 +1076,59 @@ void loop() {
       digitalWrite(LED_WIFI, ledWifiEn ? HIGH : LOW);
     }
   } else {
+    // Фиксируем момент начала отключения
     if (wasConnected) {
       wasConnected = false;
+      wifiDisconnectedSince = now;
       pushError("Потеряно соединение с WiFi!");
     }
-    unsigned long interval = (wifiAttemptCount < 6) ? 10000UL : 60000UL;
-    if (lastWifiAttemptTime == 0 || now - lastWifiAttemptTime >= interval) {
-      wifiAttemptCount++;
-      lastWifiAttemptTime = now;
-      Serial.printf("\n[WiFi] Попытка подключения %d... (SSID: %s)\n", wifiAttemptCount, wifiSSID.c_str());
-      WiFi.disconnect();
-      WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
+    if (wifiDisconnectedSince == 0) {
+      wifiDisconnectedSince = now;   // инициализация при старте без связи
     }
-    
+
+    // ── Хардовый реинит WiFi-стека ──────────────────────
+    // Если обычные WiFi.begin() не помогают дольше WIFI_HARD_REINIT_MS,
+    // сбрасываем весь стек: disconnect(true) очищает внутренние структуры
+    // драйвера, после чего WiFi.begin() стартует с чистого листа.
+    unsigned long disconnectedFor = now - wifiDisconnectedSince;
+    bool hardReinitDue =
+        (disconnectedFor >= WIFI_HARD_REINIT_MS) &&
+        (lastHardReinitTime == 0 ||
+         now - lastHardReinitTime >= WIFI_HARD_REINIT_INTERVAL_MS);
+
+    if (hardReinitDue) {
+      hardReinitCount++;
+      lastHardReinitTime    = now;
+      lastWifiAttemptTime   = now;   // не даём мягкому реконнекту сразу перебить
+      wifiAttemptCount      = 1;
+
+      Serial.printf("\n[WiFi] ХАРД-РЕИНИТ #%d — нет связи %lu сек, сброс стека...\n",
+                    hardReinitCount, disconnectedFor / 1000UL);
+
+      // Полный сброс: wifiOff убирает и внутренние структуры драйвера
+      WiFi.disconnect(true /*wifioff*/);
+      delay(200);                    // даём стеку время освободить ресурсы
+      WiFi.mode(WIFI_STA);
+      delay(100);
+      WiFi.begin(wifiSSID, wifiPassword);
+
+      pushError("WiFi: выполнен хардовый реинит стека.");
+      Serial.println("[WiFi] Хард-реинит выполнен, ожидаем подключения...");
+
+    } else {
+      // Обычный мягкий реконнект: раз в 10 с (первые 6 попыток), затем раз в 60 с
+      unsigned long interval = (wifiAttemptCount < 6) ? 10000UL : 60000UL;
+      if (lastWifiAttemptTime == 0 || now - lastWifiAttemptTime >= interval) {
+        wifiAttemptCount++;
+        lastWifiAttemptTime = now;
+        Serial.printf("\n[WiFi] Попытка подключения %d... (SSID: %s, нет связи %lu сек)\n",
+                      wifiAttemptCount, wifiSSID, disconnectedFor / 1000UL);
+        WiFi.disconnect();
+        WiFi.begin(wifiSSID, wifiPassword);
+      }
+    }
+    // ────────────────────────────────────────────────────
+
     static unsigned long lastLed = 0;
     if (now - lastLed >= 1000) {
       lastLed = now;
@@ -1019,13 +1141,15 @@ void loop() {
     char c = Serial.read();
     lastSerialTime = now;
     if (c == '\n' || c == '\r') {
-      if (serialInputBuffer.length() > 0) {
+      if (serialInputBuffer[0] != 0) {
         processSerialCommand(serialInputBuffer);
-        serialInputBuffer = "";
+        serialInputBuffer[0] = 0;
       }
     } else {
-      if (serialInputBuffer.length() < 128) {
-        serialInputBuffer += c;
+      int slen = strlen(serialInputBuffer);
+      if (slen < 128) {
+        serialInputBuffer[slen]     = c;
+        serialInputBuffer[slen + 1] = 0;
       }
     }
   }
@@ -1034,7 +1158,7 @@ void loop() {
   if (serialState != STATE_IDLE && now - lastSerialTime > 60000) {
     Serial.println("\n[Serial] Тайм-аут настройки. Возврат в обычный режим.");
     serialState = STATE_IDLE;
-    serialInputBuffer = "";
+    serialInputBuffer[0] = 0;
   }
 
   // 7. Уступаем CPU (TWDT)

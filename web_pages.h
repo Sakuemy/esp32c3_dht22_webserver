@@ -428,7 +428,7 @@ input:focus{border-color:#7dd3fc}
 button{width:100%;background:#2563eb;color:#fff;border:none;border-radius:8px;padding:11px;font-size:1rem;cursor:pointer}
 button:hover{background:#1d4ed8}
 .err{color:#ef4444;font-size:.85rem;margin-top:10px;min-height:1.2em}
-.back{margin-top:16px;font-size:.8rem;color:#64748b}<br>
+.back{margin-top:16px;font-size:.8rem;color:#64748b}
 .back a{color:#7dd3fc;text-decoration:none}
 </style>
 </head>
