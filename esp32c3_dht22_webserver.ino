@@ -10,7 +10,7 @@
  *   - DHT sensor library  by Adafruit  (+ Adafruit Unified Sensor)
  *   - ESPAsyncWebServer   by me-no-dev
  *   - AsyncTCP            by me-no-dev
- *   Preferences — встроена в ESP32 Arduino core (NVS)
+ *   Preferences, WiFiClientSecure, HTTPClient — встроены в ESP32 Arduino core 3.x
  */
 
 #include <WiFi.h>
@@ -24,6 +24,10 @@
 #include <freertos/semphr.h>
 
 #include "secrets.h"
+#include "notify.h"
+
+// TLS-рукопожатие уведомлений выполняется в loop() — стандартных 8 КБ стека может не хватить
+SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 
 // ════════════════════════════════════════════════════════
 //  ▸ НАСТРОЙКИ — измените под свою сеть
@@ -194,6 +198,59 @@ void saveSettings() {
   prefs.putFloat("batCalib", batCalib);
   prefs.putBool("ledWifiEn", ledWifiEn);
   prefs.putBool("ledTxEn", ledTxEn);
+  prefs.end();
+}
+
+// ════════════════════════════════════════════════════════
+//  ▸ НАСТРОЙКИ УВЕДОМЛЕНИЙ (NVS namespace "notify")
+//    Изменяются из async_tcp, читаются из loop() — доступ под dataMutex
+// ════════════════════════════════════════════════════════
+static NotifyConfig notifyCfg;
+
+static void loadNotifyStr(const char* key, char* dst, size_t len) {
+  if (prefs.isKey(key)) prefs.getString(key, dst, len);
+}
+
+void loadNotifySettings() {
+  memset(&notifyCfg, 0, sizeof(notifyCfg));
+  prefs.begin("notify", true);
+  notifyCfg.tempEn    = prefs.getBool("tempEn", false);
+  notifyCfg.tempMin   = prefs.getFloat("tempMin", 15.0f);
+  notifyCfg.tempMax   = prefs.getFloat("tempMax", 30.0f);
+  notifyCfg.humEn     = prefs.getBool("humEn", false);
+  notifyCfg.humMin    = prefs.getFloat("humMin", 30.0f);
+  notifyCfg.humMax    = prefs.getFloat("humMax", 70.0f);
+  notifyCfg.repeatMin = prefs.getUShort("repeatMin", 60);
+  notifyCfg.tgEn      = prefs.getBool("tgEn", false);
+  loadNotifyStr("tgToken", notifyCfg.tgToken, sizeof(notifyCfg.tgToken));
+  loadNotifyStr("tgChat",  notifyCfg.tgChatId, sizeof(notifyCfg.tgChatId));
+  notifyCfg.mailEn    = prefs.getBool("mailEn", false);
+  loadNotifyStr("smtpHost", notifyCfg.smtpHost, sizeof(notifyCfg.smtpHost));
+  notifyCfg.smtpPort  = prefs.getUShort("smtpPort", 465);
+  loadNotifyStr("smtpUser", notifyCfg.smtpUser, sizeof(notifyCfg.smtpUser));
+  loadNotifyStr("smtpPass", notifyCfg.smtpPass, sizeof(notifyCfg.smtpPass));
+  loadNotifyStr("mailTo",   notifyCfg.mailTo,   sizeof(notifyCfg.mailTo));
+  prefs.end();
+}
+
+void saveNotifySettings(const NotifyConfig& c) {
+  prefs.begin("notify", false);
+  prefs.putBool("tempEn", c.tempEn);
+  prefs.putFloat("tempMin", c.tempMin);
+  prefs.putFloat("tempMax", c.tempMax);
+  prefs.putBool("humEn", c.humEn);
+  prefs.putFloat("humMin", c.humMin);
+  prefs.putFloat("humMax", c.humMax);
+  prefs.putUShort("repeatMin", c.repeatMin);
+  prefs.putBool("tgEn", c.tgEn);
+  prefs.putString("tgToken", c.tgToken);
+  prefs.putString("tgChat", c.tgChatId);
+  prefs.putBool("mailEn", c.mailEn);
+  prefs.putString("smtpHost", c.smtpHost);
+  prefs.putUShort("smtpPort", c.smtpPort);
+  prefs.putString("smtpUser", c.smtpUser);
+  prefs.putString("smtpPass", c.smtpPass);
+  prefs.putString("mailTo", c.mailTo);
   prefs.end();
 }
 
@@ -577,6 +634,177 @@ static const char* buildDevicesJson() {
 }
 
 // ════════════════════════════════════════════════════════
+//  ▸ УВЕДОМЛЕНИЯ — контроль границ и тестовая отправка
+// ════════════════════════════════════════════════════════
+#define TEMP_HYST 0.5f   // возврат в норму только после отхода от границы на гистерезис,
+#define HUM_HYST  2.0f   // чтобы шум датчика у границы не порождал поток сообщений
+
+static int8_t        tempAlertState = 0;   // -1 ниже нормы, 0 норма, 1 выше нормы
+static int8_t        humAlertState  = 0;
+static unsigned long lastAlertSent  = 0;
+
+// Тестовая отправка: запрос ставит веб-обработчик, выполняет loop()
+enum NotifyChannel : uint8_t { NOTIFY_CH_NONE = 0, NOTIFY_CH_TG = 1, NOTIFY_CH_MAIL = 2 };
+enum NotifyTestState : uint8_t { TEST_IDLE, TEST_PENDING, TEST_OK, TEST_ERROR };
+static volatile uint8_t notifyTestReq   = NOTIFY_CH_NONE;
+static volatile uint8_t notifyTestState = TEST_IDLE;
+static char             notifyTestMsg[160] = "";
+
+static bool snapshotNotifyCfg(NotifyConfig& out) {
+  if (MUTEX_TAKE() != pdTRUE) return false;
+  out = notifyCfg;
+  MUTEX_GIVE();
+  return true;
+}
+
+static int8_t evalRange(float v, float lo, float hi, float hyst, int8_t prev) {
+  if (v > hi) return 1;
+  if (v < lo) return -1;
+  if (prev == 1  && v > hi - hyst) return 1;
+  if (prev == -1 && v < lo + hyst) return -1;
+  return 0;
+}
+
+// Отправка во все включённые каналы; ошибки попадают в очередь ошибок веб-интерфейса
+// (pushError обрезает сообщение до ERROR_MSG_LEN)
+static void notifyAll(const NotifyConfig& c, const char* subject, const char* text) {
+  char err[128];
+  char msg[sizeof(err) + 64];
+  if (c.tgEn && !sendTelegram(c, text, err, sizeof(err))) {
+    Serial.printf("[Notify] Telegram: %s\n", err);
+    snprintf(msg, sizeof(msg), "Уведомление Telegram не отправлено: %s", err);
+    pushError(msg);
+  }
+  if (c.mailEn && !sendEmail(c, subject, text, err, sizeof(err))) {
+    Serial.printf("[Notify] E-mail: %s\n", err);
+    snprintf(msg, sizeof(msg), "Уведомление e-mail не отправлено: %s", err);
+    pushError(msg);
+  }
+}
+
+static const char* rangeWord(int8_t s) { return s > 0 ? "выше нормы" : "ниже нормы"; }
+
+// Вызывается после каждого успешного чтения DHT22
+static void checkAlerts(float t, float h) {
+  NotifyConfig c;
+  if (!snapshotNotifyCfg(c)) return;
+  if (!c.tgEn && !c.mailEn) { tempAlertState = humAlertState = 0; return; }
+
+  int8_t ts = c.tempEn ? evalRange(t, c.tempMin, c.tempMax, TEMP_HYST, tempAlertState) : 0;
+  int8_t hs = c.humEn  ? evalRange(h, c.humMin,  c.humMax,  HUM_HYST,  humAlertState)  : 0;
+  bool changed = (ts != tempAlertState) || (hs != humAlertState);
+  bool remind  = !changed && (ts || hs) && c.repeatMin > 0 &&
+                 millis() - lastAlertSent >= c.repeatMin * 60000UL;
+  if (!changed && !remind) return;
+  // Без сети состояние не фиксируем — попробуем при следующем опросе датчика
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  char text[512];
+  char* p = text, *end = text + sizeof(text) - 1;
+  bool hasLines = false;
+  APPEND_JSON("%s ESP32-C3 Monitor%s\n", (ts || hs) ? "⚠️" : "✅", remind ? " — напоминание" : "");
+  if (ts) {
+    APPEND_JSON("🌡 Температура %.1f °C — %s (%.1f…%.1f °C)\n", t, rangeWord(ts), c.tempMin, c.tempMax);
+    hasLines = true;
+  } else if (tempAlertState && c.tempEn) {
+    APPEND_JSON("🌡 Температура %.1f °C — снова в норме\n", t);
+    hasLines = true;
+  }
+  if (hs) {
+    APPEND_JSON("💧 Влажность %.1f %% — %s (%.0f…%.0f %%)\n", h, rangeWord(hs), c.humMin, c.humMax);
+    hasLines = true;
+  } else if (humAlertState && c.humEn) {
+    APPEND_JSON("💧 Влажность %.1f %% — снова в норме\n", h);
+    hasLines = true;
+  }
+  APPEND_JSON("Сейчас: %.1f °C, %.1f %%", t, h);
+
+  tempAlertState = ts;
+  humAlertState  = hs;
+  lastAlertSent  = millis();
+  if (!hasLines) return;   // контроль параметра выключили — сообщать нечего
+
+  const char* subject = (ts || hs) ? "ESP32-C3: выход за границы" : "ESP32-C3: показания в норме";
+  Serial.printf("[Notify] %s\n", subject);
+  notifyAll(c, subject, text);
+}
+
+static void setTestResult(uint8_t state, const char* msg) {
+  if (MUTEX_TAKE() == pdTRUE) {
+    strncpy(notifyTestMsg, msg, sizeof(notifyTestMsg) - 1);
+    notifyTestMsg[sizeof(notifyTestMsg) - 1] = 0;
+    MUTEX_GIVE();
+  }
+  notifyTestState = state;
+}
+
+// Выполнение запрошенной тестовой отправки (из loop)
+static void processNotifyTest() {
+  uint8_t ch = notifyTestReq;
+  if (ch == NOTIFY_CH_NONE) return;
+  notifyTestReq = NOTIFY_CH_NONE;
+
+  NotifyConfig c;
+  if (!snapshotNotifyCfg(c)) { setTestResult(TEST_ERROR, "Устройство занято, повторите попытку"); return; }
+  if (WiFi.status() != WL_CONNECTED) { setTestResult(TEST_ERROR, "Нет подключения к WiFi"); return; }
+
+  float lt = NAN, lh = NAN;
+  if (MUTEX_TAKE() == pdTRUE) {
+    if (dhtSuccessValid && millis() - lastDhtSuccessTime <= 60000) { lt = curTemp; lh = curHum; }
+    MUTEX_GIVE();
+  }
+  char text[256];
+  if (isnan(lt)) {
+    snprintf(text, sizeof(text), "🔔 Тестовое уведомление ESP32-C3 Monitor\nДанные датчика пока недоступны.");
+  } else {
+    snprintf(text, sizeof(text), "🔔 Тестовое уведомление ESP32-C3 Monitor\n🌡 Температура: %.1f °C\n💧 Влажность: %.1f %%", lt, lh);
+  }
+
+  char err[128];
+  bool ok = (ch == NOTIFY_CH_TG)
+          ? sendTelegram(c, text, err, sizeof(err))
+          : sendEmail(c, "ESP32-C3: тестовое уведомление", text, err, sizeof(err));
+  const char* chName = (ch == NOTIFY_CH_TG) ? "Telegram" : "E-mail";
+  char msg[sizeof(notifyTestMsg)];
+  if (ok) snprintf(msg, sizeof(msg), "%s: тестовое сообщение отправлено", chName);
+  else    snprintf(msg, sizeof(msg), "%s: %s", chName, err);
+  Serial.printf("[Notify] Тест — %s\n", msg);
+  setTestResult(ok ? TEST_OK : TEST_ERROR, msg);
+}
+
+// JSON настроек уведомлений (секреты не отдаются — только признак, что они заданы)
+static char notifyJsonBuf[1024];
+static const char* buildNotifyJson() {
+  NotifyConfig c;
+  if (!snapshotNotifyCfg(c)) return "{\"error\":\"busy\"}";
+  char chat[sizeof(c.tgChatId) * 2], host[sizeof(c.smtpHost) * 2], user[sizeof(c.smtpUser) * 2], to[sizeof(c.mailTo) * 2];
+  jsonEscape(chat, sizeof(chat), c.tgChatId);
+  jsonEscape(host, sizeof(host), c.smtpHost);
+  jsonEscape(user, sizeof(user), c.smtpUser);
+  jsonEscape(to,   sizeof(to),   c.mailTo);
+  snprintf(notifyJsonBuf, sizeof(notifyJsonBuf),
+           "{\"tempEn\":%s,\"tempMin\":%.1f,\"tempMax\":%.1f,\"humEn\":%s,\"humMin\":%.1f,\"humMax\":%.1f,"
+           "\"repeatMin\":%u,\"tgEn\":%s,\"tgTokenSet\":%s,\"tgChatId\":\"%s\","
+           "\"mailEn\":%s,\"smtpHost\":\"%s\",\"smtpPort\":%u,\"smtpUser\":\"%s\",\"smtpPassSet\":%s,\"mailTo\":\"%s\"}",
+           c.tempEn ? "true" : "false", c.tempMin, c.tempMax,
+           c.humEn ? "true" : "false", c.humMin, c.humMax, c.repeatMin,
+           c.tgEn ? "true" : "false", c.tgToken[0] ? "true" : "false", chat,
+           c.mailEn ? "true" : "false", host, c.smtpPort, user, c.smtpPass[0] ? "true" : "false", to);
+  return notifyJsonBuf;
+}
+
+// Копирует строковый POST-параметр с обрезкой пробелов; false — если длина превышает буфер
+static bool copyParam(AsyncWebServerRequest* req, const char* name, char* dst, size_t len) {
+  if (!req->hasParam(name, true)) return true;
+  String v = req->getParam(name, true)->value();
+  v.trim();
+  if (v.length() >= len) return false;
+  strncpy(dst, v.c_str(), len - 1);
+  dst[len - 1] = 0;
+  return true;
+}
+
+// ════════════════════════════════════════════════════════
 //  ▸ HTML / JS ресурсы (вынесены в web_pages.h)
 // ════════════════════════════════════════════════════════
 #include "web_pages.h"
@@ -601,6 +829,7 @@ void setup() {
   pinMode(DHT_PIN, INPUT_PULLUP);
   initHistory();
   loadSettings();
+  loadNotifySettings();
   loadDevices();  // загружаем устройства из NVS и восстанавливаем состояние пинов
 
   // WiFi — один WiFi.begin(), ждём до 20 сек
@@ -864,6 +1093,95 @@ void setup() {
     }
   });
 
+  // GET /api/notify/config — настройки уведомлений
+  // (не "/api/notify": AsyncWebServer сопоставляет по префиксу и перехватил бы /api/notify/status)
+  server.on("/api/notify/config", HTTP_GET, [](AsyncWebServerRequest* req) {
+    blinkTx();
+    if (!isAuthorized(req)) { req->send(403, "application/json", "{\"error\":\"forbidden\"}"); return; }
+    req->send(200, "application/json", buildNotifyJson());
+  });
+
+  // POST /api/notify/save — пустые tgToken/smtpPass оставляют сохранённые значения
+  server.on("/api/notify/save", HTTP_POST, [](AsyncWebServerRequest* req) {
+    blinkTx();
+    if (!isAuthorized(req)) { req->send(403, "application/json", "{\"error\":\"forbidden\"}"); return; }
+    NotifyConfig c;
+    if (!snapshotNotifyCfg(c)) { req->send(200, "application/json", "{\"ok\":false,\"err\":\"Устройство занято, повторите попытку\"}"); return; }
+
+    auto flag = [req](const char* n, bool& dst) {
+      if (req->hasParam(n, true)) dst = req->getParam(n, true)->value().toInt() != 0;
+    };
+    auto num = [req](const char* n, float& dst) {
+      if (req->hasParam(n, true)) dst = req->getParam(n, true)->value().toFloat();
+    };
+    flag("tempEn", c.tempEn);  num("tempMin", c.tempMin); num("tempMax", c.tempMax);
+    flag("humEn",  c.humEn);   num("humMin",  c.humMin);  num("humMax",  c.humMax);
+    flag("tgEn",   c.tgEn);
+    flag("mailEn", c.mailEn);
+    if (req->hasParam("repeatMin", true)) {
+      long v = req->getParam("repeatMin", true)->value().toInt();
+      if (v < 0 || v > 1440) { req->send(200, "application/json", "{\"ok\":false,\"err\":\"Интервал повтора: 0–1440 мин\"}"); return; }
+      c.repeatMin = (uint16_t)v;
+    }
+    if (req->hasParam("smtpPort", true)) {
+      long v = req->getParam("smtpPort", true)->value().toInt();
+      if (v < 1 || v > 65535) { req->send(200, "application/json", "{\"ok\":false,\"err\":\"Некорректный порт SMTP\"}"); return; }
+      c.smtpPort = (uint16_t)v;
+    }
+
+    char tgToken[sizeof(c.tgToken)] = "", smtpPass[sizeof(c.smtpPass)] = "";
+    bool lenOk = copyParam(req, "tgToken",  tgToken,    sizeof(tgToken))
+              && copyParam(req, "tgChatId", c.tgChatId, sizeof(c.tgChatId))
+              && copyParam(req, "smtpHost", c.smtpHost, sizeof(c.smtpHost))
+              && copyParam(req, "smtpUser", c.smtpUser, sizeof(c.smtpUser))
+              && copyParam(req, "smtpPass", smtpPass,   sizeof(smtpPass))
+              && copyParam(req, "mailTo",   c.mailTo,   sizeof(c.mailTo));
+    if (!lenOk) { req->send(200, "application/json", "{\"ok\":false,\"err\":\"Слишком длинное значение в настройках уведомлений\"}"); return; }
+    if (tgToken[0])  strcpy(c.tgToken,  tgToken);
+    if (smtpPass[0]) strcpy(c.smtpPass, smtpPass);
+
+    if (c.tempMin >= c.tempMax || c.tempMin < -40 || c.tempMax > 80) {
+      req->send(200, "application/json", "{\"ok\":false,\"err\":\"Границы температуры: от -40 до 80 °C, минимум меньше максимума\"}"); return;
+    }
+    if (c.humMin >= c.humMax || c.humMin < 0 || c.humMax > 100) {
+      req->send(200, "application/json", "{\"ok\":false,\"err\":\"Границы влажности: от 0 до 100 %, минимум меньше максимума\"}"); return;
+    }
+
+    if (MUTEX_TAKE() != pdTRUE) { req->send(200, "application/json", "{\"ok\":false,\"err\":\"Устройство занято, повторите попытку\"}"); return; }
+    notifyCfg = c;
+    MUTEX_GIVE();
+    saveNotifySettings(c);
+    req->send(200, "application/json", "{\"ok\":true}");
+  });
+
+  // POST /api/notify/test — ставит тестовую отправку в очередь (выполняется в loop)
+  server.on("/api/notify/test", HTTP_POST, [](AsyncWebServerRequest* req) {
+    blinkTx();
+    if (!isAuthorized(req)) { req->send(403, "application/json", "{\"error\":\"forbidden\"}"); return; }
+    const char* ch = req->hasParam("ch", true) ? req->getParam("ch", true)->value().c_str() : "";
+    uint8_t chan = strcmp(ch, "tg") == 0 ? NOTIFY_CH_TG : strcmp(ch, "mail") == 0 ? NOTIFY_CH_MAIL : NOTIFY_CH_NONE;
+    if (chan == NOTIFY_CH_NONE) { req->send(200, "application/json", "{\"ok\":false,\"err\":\"unknown channel\"}"); return; }
+    if (notifyTestState == TEST_PENDING) { req->send(200, "application/json", "{\"ok\":false,\"err\":\"Предыдущая отправка ещё выполняется\"}"); return; }
+    notifyTestState = TEST_PENDING;
+    notifyTestReq   = chan;
+    req->send(200, "application/json", "{\"ok\":true}");
+  });
+
+  // GET /api/notify/status — результат тестовой отправки
+  server.on("/api/notify/status", HTTP_GET, [](AsyncWebServerRequest* req) {
+    blinkTx();
+    if (!isAuthorized(req)) { req->send(403, "application/json", "{\"error\":\"forbidden\"}"); return; }
+    static const char* names[] = {"idle", "pending", "ok", "error"};
+    char msg[sizeof(notifyTestMsg) * 2] = "";
+    if (MUTEX_TAKE() == pdTRUE) {
+      jsonEscape(msg, sizeof(msg), notifyTestMsg);
+      MUTEX_GIVE();
+    }
+    char buf[sizeof(msg) + 48];
+    snprintf(buf, sizeof(buf), "{\"state\":\"%s\",\"msg\":\"%s\"}", names[notifyTestState], msg);
+    req->send(200, "application/json", buf);
+  });
+
   // POST /api/device/toggle
   server.on("/api/device/toggle", HTTP_POST, [](AsyncWebServerRequest* req) {
     blinkTx();
@@ -1017,6 +1335,7 @@ void loop() {
         addSampleToSlot(t, h);
         MUTEX_GIVE();
       }
+      checkAlerts(t, h);
     } else {
       lastDhtReadFailed = true;
       pushError("Ошибка чтения датчика DHT22!");
@@ -1161,6 +1480,9 @@ void loop() {
     serialInputBuffer[0] = 0;
   }
 
-  // 7. Уступаем CPU (TWDT)
+  // 7. Тестовая отправка уведомления, запрошенная из веб-интерфейса
+  processNotifyTest();
+
+  // 8. Уступаем CPU (TWDT)
   delay(1);
 }

@@ -505,6 +505,10 @@ tr:hover td{background:#1e293b}
 .sett-msg {font-size:0.85rem}
 .err-msg {color:#ef4444}
 .ok-msg {color:#22c55e}
+.sett-row {display:flex;gap:8px}
+.sett-row > div {flex:1;min-width:0}
+.hint {font-size:.75rem;color:#64748b;margin-top:4px}
+.test-row {display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:14px}
 
 /* Модалка */
 .overlay{position:fixed;inset:0;background:#00000088;display:flex;align-items:center;justify-content:center;z-index:100;display:none}
@@ -613,6 +617,92 @@ select option{background:#1e293b}
       <div class="sett-group">
         <label for="setNewPassword">Новый пароль администратора</label>
         <input type="password" id="setNewPassword" placeholder="Оставьте пустым для сохранения текущего">
+      </div>
+    </div>
+
+    <!-- Категория 5: Уведомления — границы -->
+    <div class="sett-card">
+      <h3>Уведомления: границы</h3>
+      <div class="sett-group-row">
+        <label class="switch-label">
+          <input type="checkbox" id="setTempEn">
+          <span class="switch-text">Контролировать температуру</span>
+        </label>
+      </div>
+      <div class="sett-group sett-row">
+        <div><label for="setTempMin">Мин. (°C)</label><input type="number" id="setTempMin" step="0.5"></div>
+        <div><label for="setTempMax">Макс. (°C)</label><input type="number" id="setTempMax" step="0.5"></div>
+      </div>
+      <div class="sett-group-row">
+        <label class="switch-label">
+          <input type="checkbox" id="setHumEn">
+          <span class="switch-text">Контролировать влажность</span>
+        </label>
+      </div>
+      <div class="sett-group sett-row">
+        <div><label for="setHumMin">Мин. (%)</label><input type="number" id="setHumMin" step="1" min="0" max="100"></div>
+        <div><label for="setHumMax">Макс. (%)</label><input type="number" id="setHumMax" step="1" min="0" max="100"></div>
+      </div>
+      <div class="sett-group">
+        <label for="setRepeatMin">Повторять напоминание каждые (мин)</label>
+        <input type="number" id="setRepeatMin" step="1" min="0" max="1440">
+        <div class="hint">0 — не повторять. Сообщение отправляется при выходе за границы и при возврате в норму.</div>
+      </div>
+    </div>
+
+    <!-- Категория 6: Уведомления — Telegram -->
+    <div class="sett-card">
+      <h3>Уведомления: Telegram</h3>
+      <div class="sett-group-row">
+        <label class="switch-label">
+          <input type="checkbox" id="setTgEn">
+          <span class="switch-text">Отправлять в Telegram</span>
+        </label>
+      </div>
+      <div class="sett-group">
+        <label for="setTgToken">Токен бота</label>
+        <input type="password" id="setTgToken" maxlength="63" autocomplete="off" placeholder="123456789:AA...">
+      </div>
+      <div class="sett-group">
+        <label for="setTgChatId">Chat ID</label>
+        <input type="text" id="setTgChatId" maxlength="39" placeholder="123456789">
+        <div class="hint">Создайте бота у @BotFather и напишите ему /start. Свой Chat ID можно узнать у @userinfobot.</div>
+      </div>
+      <div class="test-row">
+        <button class="btn btn-sec" id="btnTestTg" onclick="testNotify('tg')">Отправить тест</button>
+        <span id="tgTestMsg" class="sett-msg"></span>
+      </div>
+    </div>
+
+    <!-- Категория 7: Уведомления — E-mail -->
+    <div class="sett-card">
+      <h3>Уведомления: E-mail</h3>
+      <div class="sett-group-row">
+        <label class="switch-label">
+          <input type="checkbox" id="setMailEn">
+          <span class="switch-text">Отправлять на почту</span>
+        </label>
+      </div>
+      <div class="sett-group sett-row">
+        <div style="flex:3"><label for="setSmtpHost">SMTP-сервер</label><input type="text" id="setSmtpHost" maxlength="63" placeholder="smtp.gmail.com"></div>
+        <div><label for="setSmtpPort">Порт</label><input type="number" id="setSmtpPort" min="1" max="65535" placeholder="465"></div>
+      </div>
+      <div class="sett-group">
+        <label for="setSmtpUser">Логин (адрес отправителя)</label>
+        <input type="text" id="setSmtpUser" maxlength="63" autocomplete="off" placeholder="sensor@gmail.com">
+      </div>
+      <div class="sett-group">
+        <label for="setSmtpPass">Пароль</label>
+        <input type="password" id="setSmtpPass" maxlength="63" autocomplete="new-password">
+        <div class="hint">Для Gmail, Яндекс и Mail.ru нужен пароль приложения. Порт 465 — SSL/TLS, 587 — STARTTLS.</div>
+      </div>
+      <div class="sett-group">
+        <label for="setMailTo">Получатель</label>
+        <input type="text" id="setMailTo" maxlength="127" placeholder="me@example.com, other@example.com">
+      </div>
+      <div class="test-row">
+        <button class="btn btn-sec" id="btnTestMail" onclick="testNotify('mail')">Отправить тест</button>
+        <span id="mailTestMsg" class="sett-msg"></span>
       </div>
     </div>
   </div>
@@ -745,6 +835,93 @@ function loadConfig() {
       document.getElementById('setLedTx').checked = d.ledTxEn;
     })
     .catch(() => {});
+  loadNotify();
+}
+
+const $ = id => document.getElementById(id);
+const FORM_HDR = { 'Content-Type': 'application/x-www-form-urlencoded' };
+
+function loadNotify() {
+  fetch('/api/notify/config')
+    .then(r => r.json())
+    .then(d => {
+      $('setTempEn').checked = d.tempEn;
+      $('setTempMin').value = d.tempMin;
+      $('setTempMax').value = d.tempMax;
+      $('setHumEn').checked = d.humEn;
+      $('setHumMin').value = d.humMin;
+      $('setHumMax').value = d.humMax;
+      $('setRepeatMin').value = d.repeatMin;
+      $('setTgEn').checked = d.tgEn;
+      $('setTgToken').value = '';
+      $('setTgToken').placeholder = d.tgTokenSet ? 'сохранён — оставьте пустым, чтобы не менять' : '123456789:AA...';
+      $('setTgChatId').value = d.tgChatId;
+      $('setMailEn').checked = d.mailEn;
+      $('setSmtpHost').value = d.smtpHost;
+      $('setSmtpPort').value = d.smtpPort;
+      $('setSmtpUser').value = d.smtpUser;
+      $('setSmtpPass').value = '';
+      $('setSmtpPass').placeholder = d.smtpPassSet ? 'сохранён — оставьте пустым, чтобы не менять' : '';
+      $('setMailTo').value = d.mailTo;
+    })
+    .catch(() => {});
+}
+
+// Сохраняет настройки уведомлений; возвращает Promise, отклоняемый с текстом ошибки
+function saveNotify() {
+  const n = id => parseFloat($(id).value);
+  const tMin = n('setTempMin'), tMax = n('setTempMax'), hMin = n('setHumMin'), hMax = n('setHumMax');
+  const rep = parseInt($('setRepeatMin').value), port = parseInt($('setSmtpPort').value);
+  if ([tMin, tMax, hMin, hMax, rep, port].some(isNaN)) return Promise.reject(new Error('Заполните числовые поля уведомлений'));
+  if (tMin >= tMax) return Promise.reject(new Error('Мин. температура должна быть меньше максимальной'));
+  if (hMin >= hMax) return Promise.reject(new Error('Мин. влажность должна быть меньше максимальной'));
+  const p = new URLSearchParams({
+    tempEn: $('setTempEn').checked ? 1 : 0, tempMin: tMin, tempMax: tMax,
+    humEn: $('setHumEn').checked ? 1 : 0, humMin: hMin, humMax: hMax, repeatMin: rep,
+    tgEn: $('setTgEn').checked ? 1 : 0, tgToken: $('setTgToken').value.trim(), tgChatId: $('setTgChatId').value.trim(),
+    mailEn: $('setMailEn').checked ? 1 : 0, smtpHost: $('setSmtpHost').value.trim(), smtpPort: port,
+    smtpUser: $('setSmtpUser').value.trim(), smtpPass: $('setSmtpPass').value, mailTo: $('setMailTo').value.trim()
+  });
+  return fetch('/api/notify/save', { method: 'POST', headers: FORM_HDR, body: p.toString() })
+    .then(r => r.json())
+    .then(d => {
+      if (!d.ok) throw new Error(d.err || 'Ошибка при сохранении уведомлений');
+      loadNotify();
+    });
+}
+
+// Тест: сохраняет настройки, ставит отправку в очередь и опрашивает результат
+function testNotify(ch) {
+  const msg = $(ch === 'tg' ? 'tgTestMsg' : 'mailTestMsg');
+  const btn = $(ch === 'tg' ? 'btnTestTg' : 'btnTestMail');
+  const show = (text, cls) => { msg.className = 'sett-msg ' + (cls || ''); msg.textContent = text; };
+  btn.disabled = true;
+  show('Сохранение настроек…');
+  saveNotify()
+    .then(() => {
+      show('Отправка…');
+      return fetch('/api/notify/test', { method: 'POST', headers: FORM_HDR, body: 'ch=' + ch }).then(r => r.json());
+    })
+    .then(d => {
+      if (!d.ok) throw new Error(d.err || 'Ошибка');
+      return new Promise((resolve, reject) => {
+        let tries = 0;
+        const poll = () => fetch('/api/notify/status').then(r => r.json()).then(s => {
+          if (s.state === 'pending') {
+            if (++tries > 45) return reject(new Error('Нет ответа от устройства'));
+            return setTimeout(poll, 1000);
+          }
+          if (s.state === 'ok') resolve(s.msg); else reject(new Error(s.msg || 'Ошибка отправки'));
+        }).catch(() => {
+          if (++tries > 45) reject(new Error('Нет ответа от устройства'));
+          else setTimeout(poll, 1000);
+        });
+        setTimeout(poll, 1000);
+      });
+    })
+    .then(text => show(text, 'ok-msg'))
+    .catch(e => show(e.message || 'Ошибка соединения', 'err-msg'))
+    .finally(() => { btn.disabled = false; });
 }
 
 function changefontSize(size) {
@@ -799,7 +976,9 @@ function saveAllSettings() {
       if (!d.ok) {
         throw new Error(d.err || 'Ошибка при сохранении настроек');
       }
-      
+      return saveNotify();
+    })
+    .then(() => {
       if (pw) {
         if (pw.length < 4 || pw.length > 32) {
           throw new Error('Пароль должен быть от 4 до 32 символов');
