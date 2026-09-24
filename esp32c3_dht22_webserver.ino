@@ -47,6 +47,8 @@ static float batCalib = 1.0f;        // калибровочный коэффи�
 static bool ledWifiEn = true;
 static bool ledTxEn = true;
 
+static char siteLabel[32] = "ESP32-C3 Monitor";  // подпись слева сверху на главной странице
+
 static char wifiSSID[65]     = "";
 static char wifiPassword[65] = "";
 
@@ -182,6 +184,8 @@ void loadSettings() {
   batCalib = prefs.getFloat("batCalib", 1.0f);
   ledWifiEn = prefs.getBool("ledWifiEn", true);
   ledTxEn = prefs.getBool("ledTxEn", true);
+  if (prefs.isKey("siteLabel")) prefs.getBytes("siteLabel", siteLabel, sizeof(siteLabel));
+  else strncpy(siteLabel, "ESP32-C3 Monitor", sizeof(siteLabel) - 1);
   prefs.end();
 }
 
@@ -198,6 +202,7 @@ void saveSettings() {
   prefs.putFloat("batCalib", batCalib);
   prefs.putBool("ledWifiEn", ledWifiEn);
   prefs.putBool("ledTxEn", ledTxEn);
+  prefs.putBytes("siteLabel", siteLabel, strlen(siteLabel) + 1);
   prefs.end();
 }
 
@@ -872,6 +877,16 @@ void setup() {
     req->send(200, "application/json", buildApiJson());
   });
 
+  // Подпись слева сверху на главной странице (без авторизации — используется на публичной странице)
+  server.on("/api/label", HTTP_GET, [](AsyncWebServerRequest* req) {
+    blinkTx();
+    char lbl[sizeof(siteLabel) * 2];
+    jsonEscape(lbl, sizeof(lbl), siteLabel);
+    char buf[80];
+    snprintf(buf, sizeof(buf), "{\"label\":\"%s\"}", lbl);
+    req->send(200, "application/json", buf);
+  });
+
   // Страница входа
   server.on("/login", HTTP_GET, [](AsyncWebServerRequest* req) {
     blinkTx();
@@ -1006,11 +1021,13 @@ void setup() {
   server.on("/api/settings", HTTP_GET, [](AsyncWebServerRequest* req) {
     blinkTx();
     if (!isAuthorized(req)) { req->send(403, "application/json", "{\"error\":\"forbidden\"}"); return; }
-    char buf[300];
+    char lbl[sizeof(siteLabel) * 2];
+    jsonEscape(lbl, sizeof(lbl), siteLabel);
+    char buf[400];
     snprintf(buf, sizeof(buf),
-             "{\"tempOffset\":%.2f,\"batMax\":%.2f,\"batMin\":%.2f,\"batR1\":%.1f,\"batR2\":%.1f,\"batCalib\":%.4f,\"ledWifiEn\":%s,\"ledTxEn\":%s}",
+             "{\"tempOffset\":%.2f,\"batMax\":%.2f,\"batMin\":%.2f,\"batR1\":%.1f,\"batR2\":%.1f,\"batCalib\":%.4f,\"ledWifiEn\":%s,\"ledTxEn\":%s,\"siteLabel\":\"%s\"}",
              tempOffset, batMax, batMin, batR1, batR2, batCalib,
-             ledWifiEn ? "true" : "false", ledTxEn ? "true" : "false");
+             ledWifiEn ? "true" : "false", ledTxEn ? "true" : "false", lbl);
     req->send(200, "application/json", buf);
   });
 
@@ -1051,6 +1068,17 @@ void setup() {
     }
     if (req->hasParam("ledTxEn", true)) {
       ledTxEn = req->getParam("ledTxEn", true)->value().toInt() != 0;
+      changed = true;
+    }
+    if (req->hasParam("siteLabel", true)) {
+      String v = req->getParam("siteLabel", true)->value();
+      v.trim();
+      if (v.length() == 0 || v.length() >= sizeof(siteLabel)) {
+        req->send(200, "application/json", "{\"ok\":false,\"err\":\"Подпись должна быть от 1 до 31 символа\"}");
+        return;
+      }
+      strncpy(siteLabel, v.c_str(), sizeof(siteLabel) - 1);
+      siteLabel[sizeof(siteLabel) - 1] = 0;
       changed = true;
     }
     if (changed) {

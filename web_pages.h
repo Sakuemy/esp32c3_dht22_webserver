@@ -39,7 +39,7 @@ canvas{flex:1;width:100%!important;min-height:0;display:block;cursor:crosshair}
 </head>
 <body>
 <div class="hdr">
-  <span class="logo">ESP32-C3 Monitor</span>
+  <span class="logo" id="siteLogo">ESP32-C3 Monitor</span>
   <div class="hdr-r">
     <div id="bat-container" style="display:flex;align-items:center;gap:6px;font-size:.82rem;color:#94a3b8">
       <svg id="bat-svg" width="22" height="12" viewBox="0 0 22 12" fill="none" xmlns="http://www.w3.org/2000/svg" style="vertical-align:middle">
@@ -401,6 +401,14 @@ function scheduleNextPoll(ms) {
   pollTmr = setTimeout(poll, ms);
 }
 
+function loadLabel() {
+  fetch('/api/label', { cache: 'no-store' })
+    .then(r => r.ok ? r.json() : Promise.reject())
+    .then(d => { if (d.label) document.getElementById('siteLogo').textContent = d.label; })
+    .catch(() => {});
+}
+
+loadLabel();
 poll();
 </script>
 </body>
@@ -553,6 +561,10 @@ select option{background:#1e293b}
     <!-- Категория 1: Основные -->
     <div class="sett-card">
       <h3>Основные настройки</h3>
+      <div class="sett-group">
+        <label for="setSiteLabel">Подпись слева сверху на главной странице</label>
+        <input type="text" id="setSiteLabel" maxlength="31" placeholder="ESP32-C3 Monitor">
+      </div>
       <div class="sett-group">
         <label for="setfontSize">Размер шрифта интерфейса</label>
         <select id="setfontSize" onchange="changefontSize(this.value)">
@@ -825,6 +837,7 @@ function loadConfig() {
   fetch('/api/settings')
     .then(r => r.json())
     .then(d => {
+      document.getElementById('setSiteLabel').value = d.siteLabel !== undefined ? d.siteLabel : '';
       document.getElementById('setTempOffset').value = d.tempOffset;
       document.getElementById('setBatMax').value = d.batMax;
       document.getElementById('setBatMin').value = d.batMin;
@@ -949,6 +962,7 @@ function saveAllSettings() {
   errDiv.textContent = '';
   okDiv.textContent = '';
   
+  const siteLabel = document.getElementById('setSiteLabel').value.trim();
   const offset = parseFloat(document.getElementById('setTempOffset').value);
   const batMax = parseFloat(document.getElementById('setBatMax').value);
   const batMin = parseFloat(document.getElementById('setBatMin').value);
@@ -963,8 +977,12 @@ function saveAllSettings() {
     errDiv.textContent = 'Заполните все числовые поля корректно';
     return;
   }
+  if (!siteLabel) {
+    errDiv.textContent = 'Введите подпись для главной страницы';
+    return;
+  }
   
-  const body = `tempOffset=${encodeURIComponent(offset)}&batMax=${encodeURIComponent(batMax)}&batMin=${encodeURIComponent(batMin)}&batR1=${encodeURIComponent(batR1)}&batR2=${encodeURIComponent(batR2)}&batCalib=${encodeURIComponent(batCalib)}&ledWifiEn=${ledWifi}&ledTxEn=${ledTx}`;
+  const body = `siteLabel=${encodeURIComponent(siteLabel)}&tempOffset=${encodeURIComponent(offset)}&batMax=${encodeURIComponent(batMax)}&batMin=${encodeURIComponent(batMin)}&batR1=${encodeURIComponent(batR1)}&batR2=${encodeURIComponent(batR2)}&batCalib=${encodeURIComponent(batCalib)}&ledWifiEn=${ledWifi}&ledTxEn=${ledTx}`;
   
   fetch('/api/settings/save', {
     method: 'POST',
