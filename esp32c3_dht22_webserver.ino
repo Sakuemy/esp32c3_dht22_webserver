@@ -52,6 +52,14 @@ static char siteLabel[32] = "ESP32-C3 Monitor";  // подпись слева с
 static char wifiSSID[65]     = "";
 static char wifiPassword[65] = "";
 
+// Настройки IP-адреса: DHCP (по умолчанию) или статический
+static bool staticIpEnabled   = false;
+static char staticIp[16]      = "";              // напр. 192.168.1.50
+static char staticGateway[16] = "";               // напр. 192.168.1.1
+static char staticSubnet[16]  = "255.255.255.0";
+static char staticDns1[16]    = "";
+static char staticDns2[16]    = "";
+
 // Переменные подключения WiFi
 static int wifiAttemptCount = 0;
 static unsigned long lastWifiAttemptTime = 0;
@@ -177,6 +185,13 @@ void loadSettings() {
   else strncpy(wifiSSID, WIFI_SSID, sizeof(wifiSSID) - 1);
   if (prefs.isKey("wifiPW"))   prefs.getBytes("wifiPW",   wifiPassword, sizeof(wifiPassword));
   else strncpy(wifiPassword, WIFI_PASSWORD, sizeof(wifiPassword) - 1);
+  staticIpEnabled = prefs.getBool("ipStatic", false);
+  if (prefs.isKey("ipAddr")) prefs.getBytes("ipAddr", staticIp, sizeof(staticIp));
+  if (prefs.isKey("ipGw"))   prefs.getBytes("ipGw",   staticGateway, sizeof(staticGateway));
+  if (prefs.isKey("ipMask")) prefs.getBytes("ipMask", staticSubnet, sizeof(staticSubnet));
+  else strncpy(staticSubnet, "255.255.255.0", sizeof(staticSubnet) - 1);
+  if (prefs.isKey("ipDns1")) prefs.getBytes("ipDns1", staticDns1, sizeof(staticDns1));
+  if (prefs.isKey("ipDns2")) prefs.getBytes("ipDns2", staticDns2, sizeof(staticDns2));
   batMax   = prefs.getFloat("batMax",   4.2f);
   batMin   = prefs.getFloat("batMin",   3.0f);
   batR1    = prefs.getFloat("batR1",    230000.0f);
@@ -195,6 +210,12 @@ void saveSettings() {
   prefs.putBytes("adminPw",  adminPassword, strlen(adminPassword) + 1);
   prefs.putBytes("wifiSSID", wifiSSID,      strlen(wifiSSID)      + 1);
   prefs.putBytes("wifiPW",   wifiPassword,  strlen(wifiPassword)  + 1);
+  prefs.putBool("ipStatic",  staticIpEnabled);
+  prefs.putBytes("ipAddr",   staticIp,       strlen(staticIp)      + 1);
+  prefs.putBytes("ipGw",     staticGateway,  strlen(staticGateway) + 1);
+  prefs.putBytes("ipMask",   staticSubnet,   strlen(staticSubnet)  + 1);
+  prefs.putBytes("ipDns1",   staticDns1,     strlen(staticDns1)    + 1);
+  prefs.putBytes("ipDns2",   staticDns2,     strlen(staticDns2)    + 1);
   prefs.putFloat("batMax",   batMax);
   prefs.putFloat("batMin",   batMin);
   prefs.putFloat("batR1",    batR1);
@@ -257,6 +278,29 @@ void saveNotifySettings(const NotifyConfig& c) {
   prefs.putString("smtpPass", c.smtpPass);
   prefs.putString("mailTo", c.mailTo);
   prefs.end();
+}
+
+// ════════════════════════════════════════════════════════
+//  ▸ IP-КОНФИГУРАЦИЯ (DHCP / статический адрес)
+//    Вызывается перед каждым WiFi.begin() — WiFi.disconnect(true)
+//    сбрасывает предыдущий WiFi.config(), поэтому применяем заново.
+// ════════════════════════════════════════════════════════
+static void applyIpConfig() {
+  if (!staticIpEnabled) {
+    // (0,0,0,0) возвращает интерфейс в режим DHCP
+    WiFi.config(IPAddress((uint32_t)0), IPAddress((uint32_t)0), IPAddress((uint32_t)0));
+    return;
+  }
+  IPAddress ip, gw, sn, d1, d2;
+  bool ok = ip.fromString(staticIp) && gw.fromString(staticGateway) && sn.fromString(staticSubnet);
+  if (staticDns1[0] != 0 && !d1.fromString(staticDns1)) ok = false;
+  if (staticDns2[0] != 0 && !d2.fromString(staticDns2)) ok = false;
+  if (!ok) {
+    Serial.println("[WiFi] Некорректный статический IP в настройках, используется DHCP.");
+    WiFi.config(IPAddress((uint32_t)0), IPAddress((uint32_t)0), IPAddress((uint32_t)0));
+    return;
+  }
+  WiFi.config(ip, gw, sn, d1, d2);
 }
 
 // ════════════════════════════════════════════════════════
@@ -841,6 +885,7 @@ void setup() {
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(false);
   Serial.printf("[WiFi] Подключение к: %s\n", wifiSSID);
+  applyIpConfig();
   WiFi.begin(wifiSSID, wifiPassword);
   {
     unsigned long t0 = millis();
@@ -1023,11 +1068,16 @@ void setup() {
     if (!isAuthorized(req)) { req->send(403, "application/json", "{\"error\":\"forbidden\"}"); return; }
     char lbl[sizeof(siteLabel) * 2];
     jsonEscape(lbl, sizeof(lbl), siteLabel);
-    char buf[400];
+    char ssid[sizeof(wifiSSID) * 2];
+    jsonEscape(ssid, sizeof(ssid), wifiSSID);
+    char buf[500 + sizeof(ssid)];
     snprintf(buf, sizeof(buf),
-             "{\"tempOffset\":%.2f,\"batMax\":%.2f,\"batMin\":%.2f,\"batR1\":%.1f,\"batR2\":%.1f,\"batCalib\":%.4f,\"ledWifiEn\":%s,\"ledTxEn\":%s,\"siteLabel\":\"%s\"}",
+             "{\"tempOffset\":%.2f,\"batMax\":%.2f,\"batMin\":%.2f,\"batR1\":%.1f,\"batR2\":%.1f,\"batCalib\":%.4f,\"ledWifiEn\":%s,\"ledTxEn\":%s,\"siteLabel\":\"%s\",\"wifiSSID\":\"%s\","
+             "\"ipMode\":\"%s\",\"ip\":\"%s\",\"gateway\":\"%s\",\"subnet\":\"%s\",\"dns1\":\"%s\",\"dns2\":\"%s\",\"currentIp\":\"%s\"}",
              tempOffset, batMax, batMin, batR1, batR2, batCalib,
-             ledWifiEn ? "true" : "false", ledTxEn ? "true" : "false", lbl);
+             ledWifiEn ? "true" : "false", ledTxEn ? "true" : "false", lbl, ssid,
+             staticIpEnabled ? "static" : "dhcp", staticIp, staticGateway, staticSubnet, staticDns1, staticDns2,
+             WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "");
     req->send(200, "application/json", buf);
   });
 
@@ -1095,6 +1145,87 @@ void setup() {
     } else {
       req->send(200, "application/json", "{\"ok\":false,\"err\":\"no settings changed\"}");
     }
+  });
+
+  // POST /api/settings/wifi — смена SSID/пароля WiFi из веб-интерфейса.
+  // Пустой newPassword оставляет сохранённый пароль без изменений (аналогично tgToken/smtpPass).
+  server.on("/api/settings/wifi", HTTP_POST, [](AsyncWebServerRequest* req) {
+    blinkTx();
+    if (!isAuthorized(req)) { req->send(403, "application/json", "{\"error\":\"forbidden\"}"); return; }
+    if (!req->hasParam("ssid", true)) {
+      req->send(200, "application/json", "{\"ok\":false,\"err\":\"missing ssid\"}"); return;
+    }
+    String ssidStr = req->getParam("ssid", true)->value();
+    ssidStr.trim();
+    if (ssidStr.length() == 0 || ssidStr.length() >= sizeof(wifiSSID)) {
+      req->send(200, "application/json", "{\"ok\":false,\"err\":\"SSID должен быть от 1 до 64 символов\"}"); return;
+    }
+    String passStr = req->hasParam("password", true) ? req->getParam("password", true)->value() : "";
+    // Непустой пароль должен быть либо 0 (открытая сеть), либо 8-63 символа (требование WPA/WPA2)
+    if (passStr.length() > 0 && (passStr.length() < 8 || passStr.length() >= sizeof(wifiPassword))) {
+      req->send(200, "application/json", "{\"ok\":false,\"err\":\"Пароль WiFi: 8-63 символа или пусто для открытой сети\"}"); return;
+    }
+
+    // ── IP-адрес: DHCP или статический ──────────────────
+    String ipModeStr = req->hasParam("ipMode", true) ? req->getParam("ipMode", true)->value() : "dhcp";
+    bool wantStatic = (ipModeStr == "static");
+    IPAddress tmpIp, tmpGw, tmpSn, tmpD1, tmpD2;
+    String ipStr, gwStr, snStr, d1Str, d2Str;
+    if (wantStatic) {
+      ipStr = req->hasParam("ip", true) ? req->getParam("ip", true)->value() : "";
+      gwStr = req->hasParam("gateway", true) ? req->getParam("gateway", true)->value() : "";
+      snStr = req->hasParam("subnet", true) ? req->getParam("subnet", true)->value() : "";
+      d1Str = req->hasParam("dns1", true) ? req->getParam("dns1", true)->value() : "";
+      d2Str = req->hasParam("dns2", true) ? req->getParam("dns2", true)->value() : "";
+      ipStr.trim(); gwStr.trim(); snStr.trim(); d1Str.trim(); d2Str.trim();
+      if (!tmpIp.fromString(ipStr) || !tmpGw.fromString(gwStr) || !tmpSn.fromString(snStr)) {
+        req->send(200, "application/json", "{\"ok\":false,\"err\":\"Некорректный IP-адрес, шлюз или маска подсети\"}"); return;
+      }
+      if (d1Str.length() > 0 && !tmpD1.fromString(d1Str)) {
+        req->send(200, "application/json", "{\"ok\":false,\"err\":\"Некорректный DNS 1\"}"); return;
+      }
+      if (d2Str.length() > 0 && !tmpD2.fromString(d2Str)) {
+        req->send(200, "application/json", "{\"ok\":false,\"err\":\"Некорректный DNS 2\"}"); return;
+      }
+      if (ipStr.length() >= sizeof(staticIp) || gwStr.length() >= sizeof(staticGateway) ||
+          snStr.length() >= sizeof(staticSubnet) || d1Str.length() >= sizeof(staticDns1) ||
+          d2Str.length() >= sizeof(staticDns2)) {
+        req->send(200, "application/json", "{\"ok\":false,\"err\":\"Слишком длинное значение IP-поля\"}"); return;
+      }
+    }
+
+    strncpy(wifiSSID, ssidStr.c_str(), sizeof(wifiSSID) - 1);
+    wifiSSID[sizeof(wifiSSID) - 1] = 0;
+    // Пустой пароль в форме = "оставить как есть" ТОЛЬКО если явно передан флаг keepPassword;
+    // иначе (в т.ч. явно очищенное поле) сохраняем как открытую сеть.
+    bool keepPassword = req->hasParam("keepPassword", true) && req->getParam("keepPassword", true)->value() == "1";
+    if (!keepPassword) {
+      strncpy(wifiPassword, passStr.c_str(), sizeof(wifiPassword) - 1);
+      wifiPassword[sizeof(wifiPassword) - 1] = 0;
+    }
+
+    staticIpEnabled = wantStatic;
+    if (wantStatic) {
+      strncpy(staticIp,      ipStr.c_str(), sizeof(staticIp)      - 1); staticIp[sizeof(staticIp)-1] = 0;
+      strncpy(staticGateway, gwStr.c_str(), sizeof(staticGateway) - 1); staticGateway[sizeof(staticGateway)-1] = 0;
+      strncpy(staticSubnet,  snStr.c_str(), sizeof(staticSubnet)  - 1); staticSubnet[sizeof(staticSubnet)-1] = 0;
+      strncpy(staticDns1,    d1Str.c_str(), sizeof(staticDns1)    - 1); staticDns1[sizeof(staticDns1)-1] = 0;
+      strncpy(staticDns2,    d2Str.c_str(), sizeof(staticDns2)    - 1); staticDns2[sizeof(staticDns2)-1] = 0;
+    }
+    saveSettings();
+
+    Serial.printf("[WiFi] Настройки сети изменены через веб-интерфейс. SSID: '%s', IP: %s\n",
+                  wifiSSID, staticIpEnabled ? staticIp : "DHCP");
+
+    // Сбрасываем счётчики и переподключаемся к новой сети
+    wifiAttemptCount = 1;
+    lastWifiAttemptTime = millis();
+    wifiDisconnectedSince = 0;
+    WiFi.disconnect();
+    applyIpConfig();
+    WiFi.begin(wifiSSID, wifiPassword);
+
+    req->send(200, "application/json", "{\"ok\":true}");
   });
 
   // POST /api/settings/password
@@ -1294,6 +1425,7 @@ static void processSerialCommand(char* cmd) {
 
     // Переподключаемся
     WiFi.disconnect();
+    applyIpConfig();
     WiFi.begin(wifiSSID, wifiPassword);
 
     // Сбрасываем счетчик попыток подключения
@@ -1457,6 +1589,7 @@ void loop() {
       delay(200);                    // даём стеку время освободить ресурсы
       WiFi.mode(WIFI_STA);
       delay(100);
+      applyIpConfig();
       WiFi.begin(wifiSSID, wifiPassword);
 
       pushError("WiFi: выполнен хардовый реинит стека.");
@@ -1471,6 +1604,7 @@ void loop() {
         Serial.printf("\n[WiFi] Попытка подключения %d... (SSID: %s, нет связи %lu сек)\n",
                       wifiAttemptCount, wifiSSID, disconnectedFor / 1000UL);
         WiFi.disconnect();
+        applyIpConfig();
         WiFi.begin(wifiSSID, wifiPassword);
       }
     }

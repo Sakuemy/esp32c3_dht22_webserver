@@ -580,6 +580,51 @@ select option{background:#1e293b}
       </div>
     </div>
 
+    <!-- Категория Wi-Fi -->
+    <div class="sett-card">
+      <h3>Wi-Fi сеть</h3>
+      <div class="sett-group">
+        <label for="setWifiSsid">Имя сети (SSID)</label>
+        <input type="text" id="setWifiSsid" maxlength="64" placeholder="MyHomeWiFi">
+      </div>
+      <div class="sett-group">
+        <label for="setWifiPass">Пароль сети</label>
+        <input type="password" id="setWifiPass" maxlength="63" placeholder="оставьте пустым, чтобы не менять">
+      </div>
+      <div class="sett-group">
+        <label for="setIpMode">IP-адрес</label>
+        <select id="setIpMode" onchange="toggleIpFields()">
+          <option value="dhcp">Автоматически (DHCP)</option>
+          <option value="static">Статический</option>
+        </select>
+      </div>
+      <div id="staticIpFields" style="display:none">
+        <div class="sett-group">
+          <label for="setIpAddr">IP-адрес устройства</label>
+          <input type="text" id="setIpAddr" placeholder="192.168.1.50">
+        </div>
+        <div class="sett-group">
+          <label for="setIpGw">Шлюз</label>
+          <input type="text" id="setIpGw" placeholder="192.168.1.1">
+        </div>
+        <div class="sett-group">
+          <label for="setIpMask">Маска подсети</label>
+          <input type="text" id="setIpMask" placeholder="255.255.255.0">
+        </div>
+        <div class="sett-group sett-row">
+          <div><label for="setIpDns1">DNS 1</label><input type="text" id="setIpDns1" placeholder="8.8.8.8"></div>
+          <div><label for="setIpDns2">DNS 2 (необязательно)</label><input type="text" id="setIpDns2" placeholder="8.8.4.4"></div>
+        </div>
+      </div>
+      <div id="wifiCurrentIp" style="font-size:.75rem;color:#64748b;margin-bottom:8px"></div>
+      <div style="font-size:.75rem;color:#64748b;margin-top:-4px;margin-bottom:8px">
+        После сохранения устройство переподключится к указанной сети. Если данные неверны, устройство станет недоступно по текущему адресу — потребуется сброс через Serial.
+      </div>
+      <button class="btn btn-pri" onclick="saveWifi()">Сохранить Wi-Fi</button>
+      <span id="setWifiErr" class="sett-msg err-msg"></span>
+      <span id="setWifiOk" class="sett-msg ok-msg"></span>
+    </div>
+
     <!-- Категория 2: Батарея -->
     <div class="sett-card">
       <h3>Параметры батареи</h3>
@@ -838,6 +883,16 @@ function loadConfig() {
     .then(r => r.json())
     .then(d => {
       document.getElementById('setSiteLabel').value = d.siteLabel !== undefined ? d.siteLabel : '';
+      document.getElementById('setWifiSsid').value = d.wifiSSID !== undefined ? d.wifiSSID : '';
+      document.getElementById('setWifiPass').value = '';
+      document.getElementById('setIpMode').value = d.ipMode === 'static' ? 'static' : 'dhcp';
+      document.getElementById('setIpAddr').value = d.ip || '';
+      document.getElementById('setIpGw').value = d.gateway || '';
+      document.getElementById('setIpMask').value = d.subnet || '255.255.255.0';
+      document.getElementById('setIpDns1').value = d.dns1 || '';
+      document.getElementById('setIpDns2').value = d.dns2 || '';
+      document.getElementById('wifiCurrentIp').textContent = d.currentIp ? ('Текущий IP: ' + d.currentIp) : '';
+      toggleIpFields();
       document.getElementById('setTempOffset').value = d.tempOffset;
       document.getElementById('setBatMax').value = d.batMax;
       document.getElementById('setBatMin').value = d.batMin;
@@ -954,6 +1009,81 @@ function switchTab(tab) {
     document.getElementById('tab-settings').classList.add('active');
     document.getElementById('btn-add-dev').style.display = 'none';
   }
+}
+
+function isValidIPv4(s) {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(s);
+  if (!m) return false;
+  return m.slice(1).every(o => Number(o) >= 0 && Number(o) <= 255);
+}
+
+function toggleIpFields() {
+  document.getElementById('staticIpFields').style.display =
+    document.getElementById('setIpMode').value === 'static' ? 'block' : 'none';
+}
+
+function saveWifi() {
+  const errDiv = document.getElementById('setWifiErr');
+  const okDiv = document.getElementById('setWifiOk');
+  errDiv.textContent = '';
+  okDiv.textContent = '';
+
+  const ssid = document.getElementById('setWifiSsid').value.trim();
+  const pass = document.getElementById('setWifiPass').value;
+  const ipMode = document.getElementById('setIpMode').value;
+
+  if (!ssid) {
+    errDiv.textContent = 'Введите имя сети (SSID)';
+    return;
+  }
+  if (pass && pass.length < 8) {
+    errDiv.textContent = 'Пароль WiFi должен быть не короче 8 символов (или пустой для открытой сети)';
+    return;
+  }
+
+  let ip = '', gw = '', mask = '', dns1 = '', dns2 = '';
+  if (ipMode === 'static') {
+    ip = document.getElementById('setIpAddr').value.trim();
+    gw = document.getElementById('setIpGw').value.trim();
+    mask = document.getElementById('setIpMask').value.trim();
+    dns1 = document.getElementById('setIpDns1').value.trim();
+    dns2 = document.getElementById('setIpDns2').value.trim();
+    if (!isValidIPv4(ip) || !isValidIPv4(gw) || !isValidIPv4(mask)) {
+      errDiv.textContent = 'Проверьте IP-адрес, шлюз и маску подсети (формат: 192.168.1.50)';
+      return;
+    }
+    if (dns1 && !isValidIPv4(dns1)) { errDiv.textContent = 'Некорректный DNS 1'; return; }
+    if (dns2 && !isValidIPv4(dns2)) { errDiv.textContent = 'Некорректный DNS 2'; return; }
+  }
+
+  const warnMsg = 'Устройство переподключится к сети "' + ssid + '"' +
+    (ipMode === 'static' ? (' со статическим IP ' + ip) : ' по DHCP') +
+    '. Если данные введены неверно, панель станет недоступна по текущему адресу. Продолжить?';
+  if (!confirm(warnMsg)) {
+    return;
+  }
+
+  // Пустое поле пароля = оставить сохранённый пароль без изменений
+  const keepPassword = pass === '' ? 1 : 0;
+
+  const p = new URLSearchParams({
+    ssid, password: pass, keepPassword, ipMode,
+    ip, gateway: gw, subnet: mask, dns1, dns2
+  });
+  fetch('/api/settings/wifi', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: p.toString()
+  })
+    .then(r => r.json())
+    .then(d => {
+      if (!d.ok) throw new Error(d.err || 'Ошибка при сохранении WiFi');
+      document.getElementById('setWifiPass').value = '';
+      okDiv.textContent = 'Настройки WiFi сохранены, переподключение...';
+    })
+    .catch(err => {
+      errDiv.textContent = err.message || 'Ошибка соединения';
+    });
 }
 
 function saveAllSettings() {
