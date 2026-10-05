@@ -379,6 +379,7 @@ function poll() {
         lastWifiReconCount = d.wifiRecon;
       }
 
+      loadLabel(); // подтягиваем актуальную подпись (и название вкладки), если её изменили в кабинете
       window._chartUpdate(d.chart);
       scheduleNextPoll(60000); // Опрос раз в минуту
     })
@@ -404,7 +405,12 @@ function scheduleNextPoll(ms) {
 function loadLabel() {
   fetch('/api/label', { cache: 'no-store' })
     .then(r => r.ok ? r.json() : Promise.reject())
-    .then(d => { if (d.label) document.getElementById('siteLogo').textContent = d.label; })
+    .then(d => {
+      if (d.label) {
+        document.getElementById('siteLogo').textContent = d.label;
+        document.title = d.label; // название вкладки браузера = подпись слева сверху
+      }
+    })
     .catch(() => {});
 }
 
