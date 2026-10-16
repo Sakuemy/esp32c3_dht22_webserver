@@ -622,6 +622,11 @@ select option{background:#1e293b}
           <div><label for="setIpDns2">DNS 2 (необязательно)</label><input type="text" id="setIpDns2" placeholder="8.8.4.4"></div>
         </div>
       </div>
+      <div class="sett-group">
+        <label for="setHostName">Сетевое имя устройства</label>
+        <input type="text" id="setHostName" maxlength="37" placeholder="webserver" autocapitalize="none" autocorrect="off" spellcheck="false" oninput="updateHostHint()">
+        <div id="hostNameHint" style="font-size:.75rem;color:#64748b;margin-top:4px"></div>
+      </div>
       <div id="wifiCurrentIp" style="font-size:.75rem;color:#64748b;margin-bottom:8px"></div>
       <div style="font-size:.75rem;color:#64748b;margin-top:-4px;margin-bottom:8px">
         После сохранения устройство переподключится к указанной сети. Если данные неверны, устройство станет недоступно по текущему адресу — потребуется сброс через Serial.
@@ -898,6 +903,8 @@ function loadConfig() {
       document.getElementById('setIpDns1').value = d.dns1 || '';
       document.getElementById('setIpDns2').value = d.dns2 || '';
       document.getElementById('wifiCurrentIp').textContent = d.currentIp ? ('Текущий IP: ' + d.currentIp) : '';
+      document.getElementById('setHostName').value = d.hostName || 'webserver';
+      updateHostHint();
       toggleIpFields();
       document.getElementById('setTempOffset').value = d.tempOffset;
       document.getElementById('setBatMax').value = d.batMax;
@@ -1023,6 +1030,22 @@ function isValidIPv4(s) {
   return m.slice(1).every(o => Number(o) >= 0 && Number(o) <= 255);
 }
 
+function normHostName(s) {
+  s = s.trim().toLowerCase();
+  if (s.endsWith('.local')) s = s.slice(0, -6);
+  return s;
+}
+
+function isValidHostName(s) {
+  return /^[a-z0-9]([a-z0-9-]{0,29}[a-z0-9])?$/.test(s);
+}
+
+function updateHostHint() {
+  const h = normHostName(document.getElementById('setHostName').value);
+  document.getElementById('hostNameHint').textContent =
+    isValidHostName(h) ? ('Адрес в сети: http://' + h + '.local') : 'Только a-z, 0-9 и дефис (не в начале и не в конце), до 31 символа';
+}
+
 function toggleIpFields() {
   document.getElementById('staticIpFields').style.display =
     document.getElementById('setIpMode').value === 'static' ? 'block' : 'none';
@@ -1040,6 +1063,11 @@ function saveWifi() {
 
   if (!ssid) {
     errDiv.textContent = 'Введите имя сети (SSID)';
+    return;
+  }
+  const hostName = normHostName(document.getElementById('setHostName').value);
+  if (!isValidHostName(hostName)) {
+    errDiv.textContent = 'Сетевое имя: только a-z, 0-9 и дефис (не в начале и не в конце), до 31 символа';
     return;
   }
   if (pass && pass.length < 8) {
@@ -1073,7 +1101,7 @@ function saveWifi() {
   const keepPassword = pass === '' ? 1 : 0;
 
   const p = new URLSearchParams({
-    ssid, password: pass, keepPassword, ipMode,
+    ssid, password: pass, keepPassword, ipMode, hostName,
     ip, gateway: gw, subnet: mask, dns1, dns2
   });
   fetch('/api/settings/wifi', {
@@ -1085,7 +1113,7 @@ function saveWifi() {
     .then(d => {
       if (!d.ok) throw new Error(d.err || 'Ошибка при сохранении WiFi');
       document.getElementById('setWifiPass').value = '';
-      okDiv.textContent = 'Настройки WiFi сохранены, переподключение...';
+      okDiv.textContent = 'Настройки сохранены, переподключение... Адрес: http://' + hostName + '.local';
     })
     .catch(err => {
       errDiv.textContent = err.message || 'Ошибка соединения';

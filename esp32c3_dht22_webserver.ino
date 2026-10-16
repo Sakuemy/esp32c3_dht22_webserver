@@ -19,6 +19,7 @@
 #include <driver/gpio.h>
 #include <esp_timer.h>
 #include <Preferences.h>
+#include <ESPmDNS.h>
 #include <time.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -48,6 +49,10 @@ static bool ledWifiEn = true;
 static bool ledTxEn = true;
 
 static char siteLabel[32] = "ESP32-C3 Monitor";  // подпись слева сверху на главной странице
+static char hostName[32] = "webserver";           // сетевое имя (mDNS): http://<hostName>.local
+static volatile bool mdnsRestartReq = false;      // запрос на перезапуск mDNS (ставит веб-обработчик)
+static bool mdnsRunning = false;
+static unsigned long lastMdnsTry = 0;            // время последней неудачной попытки запуска mDNS
 
 static char wifiSSID[65]     = "";
 static char wifiPassword[65] = "";
@@ -137,6 +142,18 @@ static bool isPinReserved(uint8_t p) {
   return p == DHT_PIN || p == LED_WIFI || p == LED_TX || p == BATTERY_PIN;
 }
 
+// Допустимое сетевое имя: 1–31 символ, a-z, 0-9 и дефис, дефис не в начале/конце (RFC 1123)
+static bool isValidHostName(const char* s) {
+  size_t n = strlen(s);
+  if (n == 0 || n > 31) return false;
+  if (s[0] == '-' || s[n - 1] == '-') return false;
+  for (size_t i = 0; i < n; i++) {
+    char c = s[i];
+    if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) return false;
+  }
+  return true;
+}
+
 void loadDevices() {
   prefs.begin("devices", true);  // read-only
   for (int i = 0; i < MAX_DEVICES; i++) {
@@ -201,6 +218,9 @@ void loadSettings() {
   ledTxEn = prefs.getBool("ledTxEn", true);
   if (prefs.isKey("siteLabel")) prefs.getBytes("siteLabel", siteLabel, sizeof(siteLabel));
   else strncpy(siteLabel, "ESP32-C3 Monitor", sizeof(siteLabel) - 1);
+  if (prefs.isKey("hostName")) prefs.getBytes("hostName", hostName, sizeof(hostName));
+  hostName[sizeof(hostName) - 1] = 0;
+  if (!isValidHostName(hostName)) strncpy(hostName, "webserver", sizeof(hostName) - 1);
   prefs.end();
 }
 
@@ -224,6 +244,7 @@ void saveSettings() {
   prefs.putBool("ledWifiEn", ledWifiEn);
   prefs.putBool("ledTxEn", ledTxEn);
   prefs.putBytes("siteLabel", siteLabel, strlen(siteLabel) + 1);
+  prefs.putBytes("hostName", hostName, strlen(hostName) + 1);
   prefs.end();
 }
 
@@ -286,6 +307,7 @@ void saveNotifySettings(const NotifyConfig& c) {
 //    сбрасывает предыдущий WiFi.config(), поэтому применяем заново.
 // ════════════════════════════════════════════════════════
 static void applyIpConfig() {
+  WiFi.setHostname(hostName);   // имя в DHCP (виден в списке клиентов роутера)
   if (!staticIpEnabled) {
     // (0,0,0,0) возвращает интерфейс в режим DHCP
     WiFi.config(IPAddress((uint32_t)0), IPAddress((uint32_t)0), IPAddress((uint32_t)0));
@@ -301,6 +323,23 @@ static void applyIpConfig() {
     return;
   }
   WiFi.config(ip, gw, sn, d1, d2);
+}
+
+// ════════════════════════════════════════════════════════
+//  ▸ mDNS — доступ по имени http://<hostName>.local
+// ════════════════════════════════════════════════════════
+static void startMdns() {
+  MDNS.end();
+  WiFi.setHostname(hostName);
+  if (MDNS.begin(hostName)) {
+    MDNS.addService("http", "tcp", 80);
+    mdnsRunning = true;
+    Serial.printf("[mDNS] Доступно по адресу: http://%s.local\n", hostName);
+  } else {
+    mdnsRunning = false;
+    lastMdnsTry = millis();
+    Serial.println("[mDNS] Не удалось запустить mDNS, повтор через 30 с");
+  }
 }
 
 // ════════════════════════════════════════════════════════
@@ -1070,14 +1109,14 @@ void setup() {
     jsonEscape(lbl, sizeof(lbl), siteLabel);
     char ssid[sizeof(wifiSSID) * 2];
     jsonEscape(ssid, sizeof(ssid), wifiSSID);
-    char buf[500 + sizeof(ssid)];
+    char buf[800 + sizeof(ssid)];
     snprintf(buf, sizeof(buf),
              "{\"tempOffset\":%.2f,\"batMax\":%.2f,\"batMin\":%.2f,\"batR1\":%.1f,\"batR2\":%.1f,\"batCalib\":%.4f,\"ledWifiEn\":%s,\"ledTxEn\":%s,\"siteLabel\":\"%s\",\"wifiSSID\":\"%s\","
-             "\"ipMode\":\"%s\",\"ip\":\"%s\",\"gateway\":\"%s\",\"subnet\":\"%s\",\"dns1\":\"%s\",\"dns2\":\"%s\",\"currentIp\":\"%s\"}",
+             "\"ipMode\":\"%s\",\"ip\":\"%s\",\"gateway\":\"%s\",\"subnet\":\"%s\",\"dns1\":\"%s\",\"dns2\":\"%s\",\"currentIp\":\"%s\",\"hostName\":\"%s\"}",
              tempOffset, batMax, batMin, batR1, batR2, batCalib,
              ledWifiEn ? "true" : "false", ledTxEn ? "true" : "false", lbl, ssid,
              staticIpEnabled ? "static" : "dhcp", staticIp, staticGateway, staticSubnet, staticDns1, staticDns2,
-             WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "");
+             WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "", hostName);
     req->send(200, "application/json", buf);
   });
 
@@ -1194,8 +1233,20 @@ void setup() {
       }
     }
 
+    // ── Сетевое имя (mDNS): допускается ввод как "webserver" и как "webserver.local" ──
+    String hnStr = req->hasParam("hostName", true) ? req->getParam("hostName", true)->value() : String(hostName);
+    hnStr.trim();
+    hnStr.toLowerCase();
+    if (hnStr.endsWith(".local")) hnStr.remove(hnStr.length() - 6);
+    if (!isValidHostName(hnStr.c_str())) {
+      req->send(200, "application/json", "{\"ok\":false,\"err\":\"Сетевое имя: 1-31 символ, латиница a-z, цифры и дефис (не в начале/конце)\"}"); return;
+    }
+
     strncpy(wifiSSID, ssidStr.c_str(), sizeof(wifiSSID) - 1);
     wifiSSID[sizeof(wifiSSID) - 1] = 0;
+    strncpy(hostName, hnStr.c_str(), sizeof(hostName) - 1);
+    hostName[sizeof(hostName) - 1] = 0;
+    mdnsRestartReq = true;
     // Пустой пароль в форме = "оставить как есть" ТОЛЬКО если явно передан флаг keepPassword;
     // иначе (в т.ч. явно очищенное поле) сохраняем как открытую сеть.
     bool keepPassword = req->hasParam("keepPassword", true) && req->getParam("keepPassword", true)->value() == "1";
@@ -1548,6 +1599,12 @@ void loop() {
       lastWifiAttemptTime = 0;
     }
 
+    // mDNS: запускаем после подключения, перезапускаем при смене имени
+    if (mdnsRestartReq) { mdnsRestartReq = false; mdnsRunning = false; lastMdnsTry = 0; }
+    if (!mdnsRunning && (lastMdnsTry == 0 || now - lastMdnsTry >= 30000UL)) {
+      startMdns();   // при неудаче сам выставит lastMdnsTry — повтор не чаще раза в 30 с
+    }
+
     // LED WiFi (if enabled)
     static unsigned long lastLed = 0;
     if (now - lastLed >= 1000) {
@@ -1555,6 +1612,7 @@ void loop() {
       digitalWrite(LED_WIFI, ledWifiEn ? HIGH : LOW);
     }
   } else {
+    mdnsRunning = false;   // после реконнекта (возможно, с новым IP) mDNS стартует заново
     // Фиксируем момент начала отключения
     if (wasConnected) {
       wasConnected = false;
