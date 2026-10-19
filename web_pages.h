@@ -18,7 +18,7 @@ html,body{width:100%;height:100%;overflow:hidden;background:#0f172a;color:#e2e8f
 body{display:flex;flex-direction:column;padding:10px;gap:8px}
 .hdr{display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
 .logo{font-size:1.1rem;font-weight:700;color:#7dd3fc}
-.hdr-r{display:flex;align-items:center;gap:14px;font-size:.82rem;color:#94a3b8}
+.hdr-r{display:flex;align-items:center;justify-content:flex-end;flex-wrap:wrap;gap:6px 14px;font-size:.82rem;color:#94a3b8}
 #clock{font-variant-numeric:tabular-nums}
 .dot{width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:4px;vertical-align:middle}
 .on-dot{background:#22c55e;box-shadow:0 0 6px #22c55e}
@@ -50,6 +50,7 @@ canvas{flex:1;width:100%!important;min-height:0;display:block;cursor:crosshair}
       </svg>
       <span id="bat-text">--% (--.-- В)</span>
     </div>
+    <span id="ram-text" title="Свободно / всего внутренней оперативной памяти (heap)">ОЗУ: -- из -- КБ</span>
     <span id="clock">--:--:--</span>
     <span id="uptime" style="font-size:.82rem;color:#64748b">Аптайм: --</span>
     <span><span class="dot off-dot" id="stDot"></span><span id="stTxt" class="off">Offline</span></span>
@@ -61,7 +62,7 @@ canvas{flex:1;width:100%!important;min-height:0;display:block;cursor:crosshair}
   <div class="card"><div class="card-lbl">Влажность</div><div class="card-val hum" id="hV">--.- %</div></div>
 </div>
 <div class="chart-box">
-  <div class="chart-ttl">Температура и влажность — последние 24 ч (среднее за 10 мин)</div>
+  <div class="chart-ttl" id="chartTtl">Температура и влажность</div>
   <canvas id="chart"></canvas>
   <div id="tip"></div>
 </div>
@@ -137,7 +138,7 @@ function showToast(msg, type = 'error') {
 (function(){
   const cv=document.getElementById('chart'),ctx=cv.getContext('2d'),tip=document.getElementById('tip');
   const DPR=window.devicePixelRatio||1;
-  let data={times:[],temp:[],hum:[]};
+  let data={step:60,times:[],temp:[],hum:[]};
   // Сохраняем параметры последней отрисовки для tooltip
   let lastDraw={PL:0,PR:0,PT:0,PB:0,PW:0,PH:0,N:0,tMn:0,tMx:0,CW:0,CH:0};
 
@@ -189,17 +190,22 @@ function showToast(msg, type = 'error') {
       ctx.fillText(v.toFixed(0)+'%',PL+PW+7,PT+(g/4)*PH+7);
     }
 
+    // Формат подписи оси X зависит от периода и охвата: секунды — при шаге < 1 мин, дата — при охвате от суток
+    const STEP=data.step||60,spanSec=(N-1)*STEP;
     const formatTime=ts=>{
       const d=new Date(ts*1000);
-      return p2(d.getHours())+':'+p2(d.getMinutes());
+      let s=p2(d.getHours())+':'+p2(d.getMinutes());
+      if(STEP<60)s+=':'+p2(d.getSeconds());
+      if(spanSec>=86400)s=p2(d.getDate())+'.'+p2(d.getMonth()+1)+' '+s;
+      return s;
     };
 
-    // Метки X
+    // Метки X: идём от самой новой точки влево, число меток подбираем по ширине подписи
     ctx.fillStyle='#64748b';ctx.textAlign='center';ctx.font='20px system-ui';
-    const st=Math.max(1,Math.floor(N/6));
-    const shown=new Set();
-    for(let i=0;i<N;i+=st){ctx.fillText(formatTime(TMS[i]),xOf(i),PT+PH+26);shown.add(i);}
-    if(!shown.has(N-1))ctx.fillText(formatTime(TMS[N-1]),xOf(N-1),PT+PH+26);
+    const lw=ctx.measureText(formatTime(TMS[N-1])).width+24;
+    const maxL=Math.max(2,Math.floor(PW/lw));
+    const st=Math.max(1,Math.ceil((N-1)/(maxL-1)));
+    for(let i=N-1;i>=0;i-=st)ctx.fillText(formatTime(TMS[i]),xOf(i),PT+PH+26);
 
     // Линия температуры
     ctx.strokeStyle='#fb923c';ctx.lineWidth=2.5;ctx.lineJoin='round';
@@ -219,15 +225,18 @@ function showToast(msg, type = 'error') {
     }
     ctx.stroke();
 
+    // Маркеры точек — только если между ними достаточно места
+    const showDots=PW/(N-1)>=9;
+
     // Точки на кривой температуры (полые круги)
-    for(let i=0;i<N;i++){
+    for(let i=0;showDots&&i<N;i++){
       if(TMP[i]===null||isNaN(TMP[i]))continue;
       ctx.beginPath();ctx.arc(xOf(i),yT(TMP[i]),4.5,0,2*Math.PI);ctx.fillStyle='#fb923c';ctx.fill();
       ctx.beginPath();ctx.arc(xOf(i),yT(TMP[i]),2.5,0,2*Math.PI);ctx.fillStyle='#1e293b';ctx.fill();
     }
 
     // Точки на кривой влажности (полые круги)
-    for(let i=0;i<N;i++){
+    for(let i=0;showDots&&i<N;i++){
       if(HUM[i]===null||isNaN(HUM[i]))continue;
       ctx.beginPath();ctx.arc(xOf(i),yH(HUM[i]),4.5,0,2*Math.PI);ctx.fillStyle='#38bdf8';ctx.fill();
       ctx.beginPath();ctx.arc(xOf(i),yH(HUM[i]),2.5,0,2*Math.PI);ctx.fillStyle='#1e293b';ctx.fill();
@@ -260,7 +269,7 @@ function showToast(msg, type = 'error') {
     
     const d=new Date(ts*1000);
     const dateStr=p2(d.getDate())+'.'+p2(d.getMonth()+1)+'.'+d.getFullYear();
-    const timeStr=p2(d.getHours())+':'+p2(d.getMinutes());
+    const timeStr=p2(d.getHours())+':'+p2(d.getMinutes())+((data.step||60)<60?':'+p2(d.getSeconds()):'');
     
     tip.innerHTML='<b>'+dateStr+' '+timeStr+'</b><br>🌡 '+tStr+'<br>💧 '+hStr;
     // Позиционируем tooltip рядом с курсором, не выходя за края
@@ -274,7 +283,13 @@ function showToast(msg, type = 'error') {
   });
   cv.addEventListener('mouseleave',function(){tip.style.display='none';});
 
-  window._chartUpdate=function(d){data=d;draw();};
+  // c = {step, last, temp[], hum[]}: время i-й точки восстанавливаем от последней, окна идут строго с шагом step
+  window._chartUpdate=function(c){
+    const n=(c.temp||[]).length,times=new Array(n);
+    for(let i=0;i<n;i++)times[i]=c.last-(n-1-i)*c.step;
+    data={step:c.step,times:times,temp:c.temp||[],hum:c.hum||[]};
+    draw();
+  };
   window.addEventListener('resize',resize);
   resize();
 })();
@@ -310,6 +325,17 @@ function formatUptime(sec) {
   return res;
 }
 
+// Длительность в виде «24 ч», «1 ч 40 мин», «3 сут. 2 ч»
+function fmtDur(sec) {
+  sec = Math.round(sec);
+  if (sec >= 172800) {
+    const d = Math.floor(sec / 86400), h = Math.round((sec % 86400) / 3600);
+    return d + ' сут.' + (h ? ' ' + h + ' ч' : '');
+  }
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  return [h && h + ' ч', m && m + ' мин', s && s + ' сек'].filter(Boolean).join(' ') || '0 сек';
+}
+
 // Переменные состояния для уведомлений
 let lastDhtError = false;
 let lastWifiReconCount = null;
@@ -317,6 +343,8 @@ let lastWifiReconCount = null;
 // Polling с таймаутом и 3 попытками
 let failedCount = 0;
 let pollTmr = null;
+let pollMs = 60000;      // период опроса: равен периоду точек графика, но в пределах 5…60 с
+let lastLabel = null;
 
 function poll() {
   const controller = new AbortController();
@@ -332,6 +360,19 @@ function poll() {
       document.getElementById('tV').textContent = d.temp != null ? d.temp.toFixed(1) + ' °C' : '';
       document.getElementById('hV').textContent = d.hum != null ? d.hum.toFixed(1) + ' %' : '';
       document.getElementById('uptime').textContent = 'Аптайм: ' + formatUptime(d.uptime);
+
+      // Подпись платы (и название вкладки) приходит в этом же ответе
+      if (d.label && d.label !== lastLabel) {
+        lastLabel = d.label;
+        document.getElementById('siteLogo').textContent = d.label;
+        document.title = d.label;
+      }
+
+      // Оперативная память: свободно из всего
+      if (d.heapTotal > 0) {
+        document.getElementById('ram-text').textContent =
+          'ОЗУ: ' + Math.round(d.heapFree / 1024) + ' из ' + Math.round(d.heapTotal / 1024) + ' КБ';
+      }
       
       // Считывание и отрисовка батареи
       const batFill = document.getElementById('bat-fill');
@@ -379,9 +420,14 @@ function poll() {
         lastWifiReconCount = d.wifiRecon;
       }
 
-      loadLabel(); // подтягиваем актуальную подпись (и название вкладки), если её изменили в кабинете
-      window._chartUpdate(d.chart);
-      scheduleNextPoll(60000); // Опрос раз в минуту
+      const c = d.chart;
+      window._chartUpdate(c);
+      const n = c.temp.length;
+      document.getElementById('chartTtl').textContent = n > 0
+        ? 'Температура и влажность — последние ' + fmtDur(n * c.step) + ' · ' + n + ' точ. (среднее за ' + fmtDur(c.step) + ')'
+        : 'Температура и влажность — среднее за ' + fmtDur(c.step);
+      pollMs = Math.min(60000, Math.max(5000, c.step * 1000));
+      scheduleNextPoll(pollMs);
     })
     .catch(() => {
       clearTimeout(timeoutId);
@@ -392,7 +438,7 @@ function poll() {
       if (failedCount < 3) {
         setTimeout(poll, 1500); // Быстрая перепопытка через 1.5 сек
       } else {
-        scheduleNextPoll(60000); // Регулярный опрос раз в минуту
+        scheduleNextPoll(pollMs); // Регулярный опрос
       }
     });
 }
@@ -402,19 +448,6 @@ function scheduleNextPoll(ms) {
   pollTmr = setTimeout(poll, ms);
 }
 
-function loadLabel() {
-  fetch('/api/label', { cache: 'no-store' })
-    .then(r => r.ok ? r.json() : Promise.reject())
-    .then(d => {
-      if (d.label) {
-        document.getElementById('siteLogo').textContent = d.label;
-        document.title = d.label; // название вкладки браузера = подпись слева сверху
-      }
-    })
-    .catch(() => {});
-}
-
-loadLabel();
 poll();
 </script>
 </body>
@@ -584,6 +617,30 @@ select option{background:#1e293b}
         <label for="setTempOffset">Коррекция датчика температуры (°C)</label>
         <input type="number" id="setTempOffset" step="0.1" placeholder="0.0">
       </div>
+    </div>
+
+    <!-- Категория: График -->
+    <div class="sett-card">
+      <h3>График температуры и влажности</h3>
+      <div class="sett-group">
+        <label for="setHistPoints">Количество точек на графике</label>
+        <input type="number" id="setHistPoints" min="10" max="1000" step="1" placeholder="144" oninput="updateHistHint()">
+      </div>
+      <div class="sett-group">
+        <label for="setHistPeriod">Период замеров (время между точками)</label>
+        <div class="sett-row">
+          <div style="flex:2"><input type="number" id="setHistPeriod" min="1" step="1" placeholder="10" oninput="updateHistHint()"></div>
+          <div>
+            <select id="setHistUnit" onchange="updateHistHint()">
+              <option value="1">сек</option>
+              <option value="60">мин</option>
+              <option value="3600">ч</option>
+            </select>
+          </div>
+        </div>
+        <div id="histHint" class="hint"></div>
+      </div>
+      <div class="hint">Каждая точка — среднее по всем замерам датчика за период. Период: от 10 секунд до 24 часов, точек: от 10 до 1000. При смене периода накопленная история очищается; изменение числа точек историю не стирает. История хранится в ОЗУ и сбрасывается при перезагрузке.</div>
     </div>
 
     <!-- Категория Wi-Fi -->
@@ -914,12 +971,42 @@ function loadConfig() {
       document.getElementById('setBatCalib').value = d.batCalib !== undefined ? d.batCalib : 1.0;
       document.getElementById('setLedWifi').checked = d.ledWifiEn;
       document.getElementById('setLedTx').checked = d.ledTxEn;
+      if (d.histPoints !== undefined) {
+        document.getElementById('setHistPoints').value = d.histPoints;
+        // Показываем период в самой крупной единице, на которую он делится без остатка (600 с → 10 мин)
+        const per = d.histPeriodSec;
+        const unit = per % 3600 === 0 ? 3600 : (per % 60 === 0 ? 60 : 1);
+        document.getElementById('setHistUnit').value = unit;
+        document.getElementById('setHistPeriod').value = per / unit;
+        histLoaded = { sec: per };
+        histLimits = { minP: d.histMinPoints, maxP: d.histMaxPoints, minS: d.histMinPeriod, maxS: d.histMaxPeriod };
+        updateHistHint();
+      }
     })
     .catch(() => {});
   loadNotify();
 }
 
 const $ = id => document.getElementById(id);
+
+// ── График: период и число точек ─────────────────────────
+let histLoaded = null;   // период, с которым открыта страница (чтобы предупредить о сбросе истории)
+let histLimits = { minP: 10, maxP: 1000, minS: 10, maxS: 86400 };
+
+function histPeriodSec() {
+  return Math.round(parseFloat(document.getElementById('setHistPeriod').value) * parseInt(document.getElementById('setHistUnit').value, 10));
+}
+function histDur(sec) {
+  if (sec >= 172800) { const d = Math.floor(sec / 86400), h = Math.round((sec % 86400) / 3600); return d + ' сут.' + (h ? ' ' + h + ' ч' : ''); }
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), x = sec % 60;
+  return [h && h + ' ч', m && m + ' мин', x && x + ' сек'].filter(Boolean).join(' ') || '0 сек';
+}
+function updateHistHint() {
+  const pts = parseInt(document.getElementById('setHistPoints').value, 10);
+  const per = histPeriodSec();
+  const el = document.getElementById('histHint');
+  el.textContent = (pts > 0 && per > 0) ? 'График охватит последние ' + histDur(pts * per) : '';
+}
 const FORM_HDR = { 'Content-Type': 'application/x-www-form-urlencoded' };
 
 function loadNotify() {
@@ -1145,8 +1232,23 @@ function saveAllSettings() {
     errDiv.textContent = 'Введите подпись для главной страницы';
     return;
   }
+
+  const histPts = parseInt(document.getElementById('setHistPoints').value, 10);
+  const histPer = histPeriodSec();
+  if (!(histPts >= histLimits.minP && histPts <= histLimits.maxP)) {
+    errDiv.textContent = 'Количество точек на графике: от ' + histLimits.minP + ' до ' + histLimits.maxP;
+    return;
+  }
+  if (!(histPer >= histLimits.minS && histPer <= histLimits.maxS)) {
+    errDiv.textContent = 'Период замеров: от ' + histDur(histLimits.minS) + ' до ' + histDur(histLimits.maxS);
+    return;
+  }
+  if (histLoaded && histPer !== histLoaded.sec &&
+      !confirm('Период замеров изменён: накопленная история графика будет очищена. Продолжить?')) {
+    return;
+  }
   
-  const body = `siteLabel=${encodeURIComponent(siteLabel)}&tempOffset=${encodeURIComponent(offset)}&batMax=${encodeURIComponent(batMax)}&batMin=${encodeURIComponent(batMin)}&batR1=${encodeURIComponent(batR1)}&batR2=${encodeURIComponent(batR2)}&batCalib=${encodeURIComponent(batCalib)}&ledWifiEn=${ledWifi}&ledTxEn=${ledTx}`;
+  const body = `histPoints=${histPts}&histPeriodSec=${histPer}&siteLabel=${encodeURIComponent(siteLabel)}&tempOffset=${encodeURIComponent(offset)}&batMax=${encodeURIComponent(batMax)}&batMin=${encodeURIComponent(batMin)}&batR1=${encodeURIComponent(batR1)}&batR2=${encodeURIComponent(batR2)}&batCalib=${encodeURIComponent(batCalib)}&ledWifiEn=${ledWifi}&ledTxEn=${ledTx}`;
   
   fetch('/api/settings/save', {
     method: 'POST',
@@ -1158,6 +1260,7 @@ function saveAllSettings() {
       if (!d.ok) {
         throw new Error(d.err || 'Ошибка при сохранении настроек');
       }
+      histLoaded = { sec: histPer };
       return saveNotify();
     })
     .then(() => {

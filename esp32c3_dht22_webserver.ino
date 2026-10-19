@@ -116,10 +116,26 @@ static char serialInputBuffer[129] = "";
 
 // ════════════════════════════════════════════════════════
 //  ▸ ПАРАМЕТРЫ ИСТОРИИ
+//    Количество точек и период между ними задаются в кабинете
+//    (хранятся в NVS). Здесь — лимиты и значения по умолчанию.
 // ════════════════════════════════════════════════════════
-#define HISTORY_POINTS  1008                 // 24 ч × 6 точек/ч
-#define SLOT_MS         (10UL * 60 * 1000)  // окно 10 мин
-#define DHT_READ_MS     (50UL * 1000)       // опрос DHT раз в 50 сек
+#define HISTORY_MAX_POINTS  1000                // размер кольцевого буфера = максимум точек на графике
+#define HISTORY_MIN_POINTS  10
+#define HISTORY_DEF_POINTS  144                 // 24 ч при периоде 10 мин
+#define HIST_PERIOD_MIN_S   10UL                // минимальное время между точками, сек
+#define HIST_PERIOD_MAX_S   86400UL             // максимальное (сутки)
+#define HIST_PERIOD_DEF_S   600UL               // 10 мин
+#define DHT_READ_MS         (50UL * 1000)       // максимальный интервал опроса DHT (раз в 50 сек)
+
+static uint16_t          histPoints    = HISTORY_DEF_POINTS;   // сколько точек показывать (меняется под dataMutex)
+static volatile uint32_t histPeriodSec = HIST_PERIOD_DEF_S;    // время между точками, сек
+static volatile bool     histResetReq  = false;                // период изменён — loop() очистит историю
+
+// Интервал опроса датчика: не реже 2 замеров на одно окно, но не чаще DHT_READ_MS
+static inline unsigned long dhtReadIntervalMs() {
+  unsigned long half = (unsigned long)histPeriodSec * 500UL;
+  return half < DHT_READ_MS ? half : DHT_READ_MS;
+}
 
 // ════════════════════════════════════════════════════════
 //  ▸ УСТРОЙСТВА (хранятся в NVS через Preferences)
@@ -221,6 +237,10 @@ void loadSettings() {
   if (prefs.isKey("hostName")) prefs.getBytes("hostName", hostName, sizeof(hostName));
   hostName[sizeof(hostName) - 1] = 0;
   if (!isValidHostName(hostName)) strncpy(hostName, "webserver", sizeof(hostName) - 1);
+  histPoints    = prefs.getUShort("histPts", HISTORY_DEF_POINTS);
+  histPeriodSec = prefs.getUInt("histPer", HIST_PERIOD_DEF_S);
+  if (histPoints < HISTORY_MIN_POINTS || histPoints > HISTORY_MAX_POINTS) histPoints = HISTORY_DEF_POINTS;
+  if (histPeriodSec < HIST_PERIOD_MIN_S || histPeriodSec > HIST_PERIOD_MAX_S) histPeriodSec = HIST_PERIOD_DEF_S;
   prefs.end();
 }
 
@@ -245,6 +265,8 @@ void saveSettings() {
   prefs.putBool("ledTxEn", ledTxEn);
   prefs.putBytes("siteLabel", siteLabel, strlen(siteLabel) + 1);
   prefs.putBytes("hostName", hostName, strlen(hostName) + 1);
+  prefs.putUShort("histPts", histPoints);
+  prefs.putUInt("histPer", histPeriodSec);
   prefs.end();
 }
 
@@ -370,20 +392,24 @@ static bool isAuthorized(AsyncWebServerRequest* req) {
 // ════════════════════════════════════════════════════════
 //  ▸ КОЛЬЦЕВОЙ БУФЕР ИСТОРИИ
 // ════════════════════════════════════════════════════════
-struct DataPoint {
-  time_t   timestamp;
-  float    tempSum;
-  float    humSum;
-  uint16_t count;
-  float    tempAvg;
-  float    humAvg;
-  bool     ready;
+//    В кольце лежат только закрытые точки (12 байт каждая); текущее окно
+//    копит суммы отдельно и попадает в кольцо при закрытии.
+struct HistPoint {
+  uint32_t ts;     // начало окна (unix-время)
+  float    temp;   // среднее за окно; NAN — замеров в окне не было
+  float    hum;
 };
 
-static DataPoint history[HISTORY_POINTS];
-static int  historyHead  = 0;
+static HistPoint history[HISTORY_MAX_POINTS];
+static int  historyHead  = 0;   // куда ляжет следующая закрытая точка
 static int  historyCount = 0;
-static int  currentSlot  = -1;
+
+// Накопитель текущего (ещё не закрытого) окна
+static bool     slotOpen    = false;
+static uint32_t slotTs      = 0;
+static float    slotTempSum = 0.0f;
+static float    slotHumSum  = 0.0f;
+static uint16_t slotCount   = 0;
 
 static float curTemp = NAN;
 static float curHum  = NAN;
@@ -531,28 +557,30 @@ static void blinkTx() {
 static void initHistory() {
   memset(history, 0, sizeof(history));
   historyHead = historyCount = 0;
-  currentSlot = -1;
+  slotOpen = false;
+  slotTs = 0; slotTempSum = slotHumSum = 0.0f; slotCount = 0;
 }
 static void openNewSlot(time_t t) {
-  currentSlot = historyHead;
-  DataPoint& p = history[currentSlot];
-  p.timestamp = t; p.tempSum = 0; p.humSum = 0;
-  p.count = 0; p.tempAvg = NAN; p.humAvg = NAN; p.ready = false;
+  slotOpen    = true;
+  slotTs      = (uint32_t)t;
+  slotTempSum = slotHumSum = 0.0f;
+  slotCount   = 0;
 }
 static void closeCurrentSlot() {
-  if (currentSlot < 0) return;
-  DataPoint& p = history[currentSlot];
-  if (p.count > 0) { p.tempAvg = p.tempSum / p.count; p.humAvg = p.humSum / p.count; }
-  p.ready = true;
-  historyHead = (historyHead + 1) % HISTORY_POINTS;
-  if (historyCount < HISTORY_POINTS) historyCount++;
-  currentSlot = -1;
+  if (!slotOpen) return;
+  HistPoint& p = history[historyHead];
+  p.ts   = slotTs;
+  p.temp = slotCount ? slotTempSum / slotCount : NAN;
+  p.hum  = slotCount ? slotHumSum  / slotCount : NAN;
+  historyHead = (historyHead + 1) % HISTORY_MAX_POINTS;
+  if (historyCount < HISTORY_MAX_POINTS) historyCount++;
+  slotOpen = false;
 }
 static void addSampleToSlot(float t, float h) {
-  if (currentSlot < 0 || isnan(t) || isnan(h)) return;
-  history[currentSlot].tempSum += t;
-  history[currentSlot].humSum  += h;
-  history[currentSlot].count++;
+  if (!slotOpen || isnan(t) || isnan(h)) return;
+  slotTempSum += t;
+  slotHumSum  += h;
+  if (slotCount < 0xFFFF) slotCount++;
 }
 
 static float filteredBatVolts = -1.0f;
@@ -574,7 +602,8 @@ static float getBatteryVoltage() {
 // ════════════════════════════════════════════════════════
 //  ▸ JSON /api/data  (статический буфер — нет heap alloc)
 // ════════════════════════════════════════════════════════
-#define JSON_BUF_SIZE 6144
+// Размер с запасом под худший случай: шапка + очередь ошибок (с экранированием) + 14 байт на точку графика
+#define JSON_BUF_SIZE (1024 + MAX_QUEUED_ERRORS * (ERROR_MSG_LEN * 2 + 4) + HISTORY_MAX_POINTS * 14)
 static char jsonBuf[JSON_BUF_SIZE];
 
 // Безопасный макрос для добавления в буфер JSON без риска переполнения
@@ -584,8 +613,21 @@ static char jsonBuf[JSON_BUF_SIZE];
   else p = end; \
 } while(0)
 
+// Число с одним знаком после запятой (или null для NAN) без printf с плавающей точкой:
+// на ESP32-C3 нет FPU, а точек в ответе до 2000 — так заметно быстрее.
+static void appendTenths(char*& p, char* end, float v) {
+  if (end - p < 16) { p = end; return; }
+  if (isnan(v)) { memcpy(p, "null", 4); p += 4; return; }
+  long t = lroundf(v * 10.0f);
+  if (t < 0) { *p++ = '-'; t = -t; }
+  p += snprintf(p, end - p, "%ld.%ld", t / 10, t % 10);
+}
+
+// Всё, что обновляется на главной странице, отдаётся одним запросом:
+// показания, батарея, ОЗУ, аптайм, подпись платы, очередь ошибок и график.
 static const char* buildApiJson() {
   static char localErrors[MAX_QUEUED_ERRORS][ERROR_MSG_LEN];
+  static HistPoint snap[HISTORY_MAX_POINTS];   // снимок последних histPoints точек (старые → новые)
   int localErrorCount = 0;
 
   if (MUTEX_TAKE() != pdTRUE) {
@@ -594,7 +636,7 @@ static const char* buildApiJson() {
   }
   float lt = curTemp, lh = curHum;
   float vBatSnap = filteredBatVolts;  // снимок под мьютексом — защита от гонки с loop()
-  
+
   // Проверка актуальности данных за последнюю минуту
   if (!dhtSuccessValid || (millis() - lastDhtSuccessTime > 60000)) {
     lt = NAN;
@@ -602,9 +644,13 @@ static const char* buildApiJson() {
   }
 
   time_t nowT; time(&nowT);
-  int lHead = historyHead, lCount = historyCount;
-  static DataPoint snap[HISTORY_POINTS];
-  memcpy(snap, history, sizeof(history));
+
+  // Берём только последние histPoints точек; старые остаются в кольце
+  // и снова появятся, если пользователь увеличит количество точек.
+  int nPts = historyCount < (int)histPoints ? historyCount : (int)histPoints;
+  uint32_t step = histPeriodSec;
+  int start = (historyHead - nPts + HISTORY_MAX_POINTS) % HISTORY_MAX_POINTS;
+  for (int i = 0; i < nPts; i++) snap[i] = history[(start + i) % HISTORY_MAX_POINTS];
 
   // Копируем и очищаем очередь ошибок
   localErrorCount = errorQueueCount;
@@ -627,12 +673,17 @@ static const char* buildApiJson() {
     }
   }
 
+  char lbl[sizeof(siteLabel) * 2];
+  jsonEscape(lbl, sizeof(lbl), siteLabel);
+
   char* p = jsonBuf, *end = jsonBuf + JSON_BUF_SIZE - 1;
   unsigned long uptime = millis() / 1000;
-  APPEND_JSON("{\"unixSec\":%lu,\"uptime\":%lu,\"batVolts\":%.2f,\"batLevel\":%d,\"dhtError\":%s,\"wifiRecon\":%d,\"mutexTO\":%lu,\"errors\":[",
+  APPEND_JSON("{\"unixSec\":%lu,\"uptime\":%lu,\"batVolts\":%.2f,\"batLevel\":%d,\"dhtError\":%s,\"wifiRecon\":%d,\"mutexTO\":%lu,"
+              "\"heapFree\":%lu,\"heapTotal\":%lu,\"label\":\"%s\",\"errors\":[",
               (unsigned long)nowT, uptime, vBat, batLvl,
               lastDhtReadFailed ? "true" : "false", wifiReconnectCount,
-              (unsigned long)mutexTimeoutCount);
+              (unsigned long)mutexTimeoutCount,
+              (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getHeapSize(), lbl);
 
   for (int i = 0; i < localErrorCount; i++) {
     // Экранируем кавычки в сообщении об ошибке без heap-аллокаций
@@ -651,34 +702,21 @@ static const char* buildApiJson() {
   if (isnan(lh)) APPEND_JSON("\"hum\":null,");
   else           APPEND_JSON("\"hum\":%.1f,",  lh);
 
-  int oldest = (lHead - lCount + HISTORY_POINTS) % HISTORY_POINTS;
-  APPEND_JSON("\"chart\":{\"times\":[");
-  bool first = true;
-  for (int i = 0; i < lCount; i++) {
-    int idx = (oldest + i) % HISTORY_POINTS;
-    if (!snap[idx].ready) continue;
-    APPEND_JSON("%s%lu", first ? "" : ",", (unsigned long)snap[idx].timestamp);
-    first = false;
-  }
-  APPEND_JSON("],\"temp\":[");
-  first = true;
-  for (int i = 0; i < lCount; i++) {
-    int idx = (oldest + i) % HISTORY_POINTS;
-    if (!snap[idx].ready) continue;
-    if (isnan(snap[idx].tempAvg)) APPEND_JSON("%snull", first ? "" : ",");
-    else                          APPEND_JSON("%s%.1f", first ? "" : ",", snap[idx].tempAvg);
-    first = false;
+  // График: времена отдельным массивом не шлём — окна идут строго с шагом step,
+  // страница восстанавливает время каждой точки от last (время самой новой).
+  APPEND_JSON("\"chart\":{\"step\":%lu,\"last\":%lu,\"temp\":[",
+              (unsigned long)step, (unsigned long)(nPts > 0 ? snap[nPts - 1].ts : 0));
+  for (int i = 0; i < nPts; i++) {
+    if (i && p < end) *p++ = ',';
+    appendTenths(p, end, snap[i].temp);
   }
   APPEND_JSON("],\"hum\":[");
-  first = true;
-  for (int i = 0; i < lCount; i++) {
-    int idx = (oldest + i) % HISTORY_POINTS;
-    if (!snap[idx].ready) continue;
-    if (isnan(snap[idx].humAvg)) APPEND_JSON("%snull", first ? "" : ",");
-    else                         APPEND_JSON("%s%.1f", first ? "" : ",", snap[idx].humAvg);
-    first = false;
+  for (int i = 0; i < nPts; i++) {
+    if (i && p < end) *p++ = ',';
+    appendTenths(p, end, snap[i].hum);
   }
   APPEND_JSON("]}}");
+  *p = 0;
   return jsonBuf;
 }
 
@@ -955,20 +993,10 @@ void setup() {
     req->send_P(200, "text/html; charset=utf-8", HTML_MAIN);
   });
 
-  // Данные сенсора + история
+  // Всё обновляемое на главной (показания, батарея, ОЗУ, аптайм, подпись платы, график) — одним запросом
   server.on("/api/data", HTTP_GET, [](AsyncWebServerRequest* req) {
     blinkTx();
     req->send(200, "application/json", buildApiJson());
-  });
-
-  // Подпись слева сверху на главной странице (без авторизации — используется на публичной странице)
-  server.on("/api/label", HTTP_GET, [](AsyncWebServerRequest* req) {
-    blinkTx();
-    char lbl[sizeof(siteLabel) * 2];
-    jsonEscape(lbl, sizeof(lbl), siteLabel);
-    char buf[80];
-    snprintf(buf, sizeof(buf), "{\"label\":\"%s\"}", lbl);
-    req->send(200, "application/json", buf);
   });
 
   // Страница входа
@@ -1109,14 +1137,17 @@ void setup() {
     jsonEscape(lbl, sizeof(lbl), siteLabel);
     char ssid[sizeof(wifiSSID) * 2];
     jsonEscape(ssid, sizeof(ssid), wifiSSID);
-    char buf[800 + sizeof(ssid)];
+    char buf[1100 + sizeof(ssid)];
     snprintf(buf, sizeof(buf),
              "{\"tempOffset\":%.2f,\"batMax\":%.2f,\"batMin\":%.2f,\"batR1\":%.1f,\"batR2\":%.1f,\"batCalib\":%.4f,\"ledWifiEn\":%s,\"ledTxEn\":%s,\"siteLabel\":\"%s\",\"wifiSSID\":\"%s\","
-             "\"ipMode\":\"%s\",\"ip\":\"%s\",\"gateway\":\"%s\",\"subnet\":\"%s\",\"dns1\":\"%s\",\"dns2\":\"%s\",\"currentIp\":\"%s\",\"hostName\":\"%s\"}",
+             "\"ipMode\":\"%s\",\"ip\":\"%s\",\"gateway\":\"%s\",\"subnet\":\"%s\",\"dns1\":\"%s\",\"dns2\":\"%s\",\"currentIp\":\"%s\",\"hostName\":\"%s\","
+             "\"histPoints\":%u,\"histPeriodSec\":%lu,\"histMinPoints\":%d,\"histMaxPoints\":%d,\"histMinPeriod\":%lu,\"histMaxPeriod\":%lu}",
              tempOffset, batMax, batMin, batR1, batR2, batCalib,
              ledWifiEn ? "true" : "false", ledTxEn ? "true" : "false", lbl, ssid,
              staticIpEnabled ? "static" : "dhcp", staticIp, staticGateway, staticSubnet, staticDns1, staticDns2,
-             WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "", hostName);
+             WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "", hostName,
+             (unsigned)histPoints, (unsigned long)histPeriodSec, HISTORY_MIN_POINTS, HISTORY_MAX_POINTS,
+             (unsigned long)HIST_PERIOD_MIN_S, (unsigned long)HIST_PERIOD_MAX_S);
     req->send(200, "application/json", buf);
   });
 
@@ -1124,7 +1155,36 @@ void setup() {
   server.on("/api/settings/save", HTTP_POST, [](AsyncWebServerRequest* req) {
     blinkTx();
     if (!isAuthorized(req)) { req->send(403, "application/json", "{\"error\":\"forbidden\"}"); return; }
+    // Параметры графика проверяем и применяем первыми, до остальных настроек:
+    // при ошибке (или занятом мьютексе) ничего не окажется изменённым наполовину.
     bool changed = false;
+    if (req->hasParam("histPoints", true) || req->hasParam("histPeriodSec", true)) {
+      long newPts = histPoints;
+      long newPer = (long)histPeriodSec;
+      if (req->hasParam("histPoints", true))    newPts = req->getParam("histPoints", true)->value().toInt();
+      if (req->hasParam("histPeriodSec", true)) newPer = req->getParam("histPeriodSec", true)->value().toInt();
+      if (newPts < HISTORY_MIN_POINTS || newPts > HISTORY_MAX_POINTS) {
+        char msg[120];
+        snprintf(msg, sizeof(msg), "{\"ok\":false,\"err\":\"Количество точек на графике: от %d до %d\"}", HISTORY_MIN_POINTS, HISTORY_MAX_POINTS);
+        req->send(200, "application/json", msg);
+        return;
+      }
+      if (newPer < (long)HIST_PERIOD_MIN_S || newPer > (long)HIST_PERIOD_MAX_S) {
+        req->send(200, "application/json", "{\"ok\":false,\"err\":\"Период замеров: от 10 секунд до 24 часов\"}");
+        return;
+      }
+      if (MUTEX_TAKE() != pdTRUE) {
+        req->send(200, "application/json", "{\"ok\":false,\"err\":\"Устройство занято, повторите попытку\"}");
+        return;
+      }
+      histPoints = (uint16_t)newPts;
+      if ((uint32_t)newPer != histPeriodSec) {
+        histPeriodSec = (uint32_t)newPer;
+        histResetReq  = true;   // окна разной длины несопоставимы — loop() начнёт историю заново
+      }
+      MUTEX_GIVE();
+      changed = true;
+    }
     if (req->hasParam("tempOffset", true)) {
       tempOffset = req->getParam("tempOffset", true)->value().toFloat();
       changed = true;
@@ -1510,10 +1570,10 @@ void loop() {
     ledTxOffAt = 0;
   }
 
-  // 2. Опрос DHT раз в 1 мин с 3 попытками чтения; применяем TEMP_OFFSET
+  // 2. Опрос DHT (раз в 50 с, чаще — если период точек короче 100 с) с 3 попытками чтения; применяем TEMP_OFFSET
   static unsigned long lastDht = 0;
   static bool firstDhtRead = true;
-  if (firstDhtRead || now - lastDht >= DHT_READ_MS) {
+  if (firstDhtRead || now - lastDht >= dhtReadIntervalMs()) {
     firstDhtRead = false;
     lastDht = now;
     float t = NAN;
@@ -1554,9 +1614,19 @@ void loop() {
     }
   }
 
-  // 3. 10-минутные окна истории
+  // 3. Окна истории (длительность окна = период из настроек)
   static unsigned long lastSlotOpen = 0;
   static bool          ntpSynced    = false;
+  if (histResetReq) {   // период сменили в кабинете: чистим историю и начинаем новое окно
+    if (MUTEX_TAKE() == pdTRUE) {
+      histResetReq = false;
+      initHistory();
+      if (ntpSynced) { time_t t; time(&t); openNewSlot(t); lastSlotOpen = now; }
+      MUTEX_GIVE();
+      Serial.printf("[History] Период изменён: %lu с. История очищена.\n", (unsigned long)histPeriodSec);
+    }
+  }
+  const unsigned long slotMs = (unsigned long)histPeriodSec * 1000UL;
   if (!ntpSynced) {
     time_t t; time(&t);
     if (t > 1704067200UL) {
@@ -1564,8 +1634,8 @@ void loop() {
       if (MUTEX_TAKE() == pdTRUE) { openNewSlot(t); MUTEX_GIVE(); }
       Serial.println("[History] Первое окно открыто.");
     }
-  } else if (now - lastSlotOpen >= SLOT_MS) {
-    lastSlotOpen += SLOT_MS;
+  } else if (now - lastSlotOpen >= slotMs) {
+    lastSlotOpen += slotMs;
     time_t t; time(&t);
     if (MUTEX_TAKE() == pdTRUE) { closeCurrentSlot(); openNewSlot(t); MUTEX_GIVE(); }
   }
