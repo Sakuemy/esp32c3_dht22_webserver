@@ -143,9 +143,12 @@ function showToast(msg, type = 'error') {
   let lastDraw={PL:0,PR:0,PT:0,PB:0,PW:0,PH:0,N:0,tMn:0,tMx:0,CW:0,CH:0};
 
   function resize(){
-    const r=cv.parentElement.getBoundingClientRect();
-    cv.width=Math.floor(r.width*DPR);
-    cv.height=Math.floor((r.height-22)*DPR);
+    // Размер битмапа берём от реального CSS-размера canvas (а не контейнера),
+    // иначе картинка растягивается и координаты мыши не совпадают с точками
+    const w=cv.clientWidth,h=cv.clientHeight;
+    if(!w||!h)return;
+    cv.width=Math.round(w*DPR);
+    cv.height=Math.round(h*DPR);
     draw();
   }
 
@@ -256,8 +259,10 @@ function showToast(msg, type = 'error') {
     const {PL,PW,PT,PH,N}=lastDraw;
     if(N<2){tip.style.display='none';return;}
     const rect=cv.getBoundingClientRect();
-    const mx=e.clientX-rect.left;
-    const my=e.clientY-rect.top;
+    const px=e.clientX-rect.left;   // позиция мыши в CSS-пикселях canvas
+    const py=e.clientY-rect.top;
+    // Переводим в логические координаты рисования (на случай расхождения CSS-размера и битмапа)
+    const mx=px*(lastDraw.CW/rect.width);
     // Определяем ближайший индекс по X
     const frac=(mx-PL)/PW;
     if(frac<0||frac>1){tip.style.display='none';return;}
@@ -275,9 +280,11 @@ function showToast(msg, type = 'error') {
     // Позиционируем tooltip рядом с курсором, не выходя за края
     const bw=tip.offsetWidth||110,bh=tip.offsetHeight||60;
     const cw=rect.width,ch=rect.height;
-    let tx=e.clientX-rect.left+14,ty=e.clientY-rect.top-bh-8;
-    if(tx+bw>cw)tx=e.clientX-rect.left-bw-14;
-    if(ty<0)ty=e.clientY-rect.top+14;
+    // #tip позиционируется относительно .chart-box, поэтому добавляем смещение canvas внутри него
+    let tx=px+14,ty=py-bh-8;
+    if(tx+bw>cw)tx=px-bw-14;
+    if(ty<0)ty=py+14;
+    tx+=cv.offsetLeft;ty+=cv.offsetTop;
     tip.style.left=tx+'px';tip.style.top=ty+'px';
     tip.style.display='block';
   });
