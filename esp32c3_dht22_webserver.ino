@@ -6,6 +6,13 @@
  *   GPIO12 — LED WiFi (горит при подключении)
  *   GPIO13 — LED TX  (моргает при HTTP-запросе)
  *
+ * HTTP API (включается в кабинете, по умолчанию выключен):
+ *   GET /api/sensor              — {"temperature":..,"humidity":..,"uptime":..}
+ *   GET /api/sensor/temperature  — только температура (text/plain)
+ *   GET /api/sensor/humidity     — только влажность   (text/plain)
+ *   GET /api/sensor/uptime       — только аптайм, сек (text/plain)
+ *   Пароль (необязателен): заголовок X-API-Key или Authorization: Bearer, либо ?key=
+ *
  * Зависимости (Library Manager):
  *   - DHT sensor library  by Adafruit  (+ Adafruit Unified Sensor)
  *   - ESPAsyncWebServer   by me-no-dev
@@ -53,6 +60,10 @@ static char hostName[32] = "webserver";           // сетевое имя (mDNS
 static volatile bool mdnsRestartReq = false;      // запрос на перезапуск mDNS (ставит веб-обработчик)
 static bool mdnsRunning = false;
 static unsigned long lastMdnsTry = 0;            // время последней неудачной попытки запуска mDNS
+
+// Внешний API (GET /api/sensor): выключен по умолчанию, пароль необязателен (пусто — без пароля)
+static bool apiEnabled        = false;
+static char apiPassword[33]   = "";
 
 static char wifiSSID[65]     = "";
 static char wifiPassword[65] = "";
@@ -237,6 +248,9 @@ void loadSettings() {
   if (prefs.isKey("hostName")) prefs.getBytes("hostName", hostName, sizeof(hostName));
   hostName[sizeof(hostName) - 1] = 0;
   if (!isValidHostName(hostName)) strncpy(hostName, "webserver", sizeof(hostName) - 1);
+  apiEnabled = prefs.getBool("apiEn", false);
+  if (prefs.isKey("apiPw")) prefs.getBytes("apiPw", apiPassword, sizeof(apiPassword));
+  apiPassword[sizeof(apiPassword) - 1] = 0;
   histPoints    = prefs.getUShort("histPts", HISTORY_DEF_POINTS);
   histPeriodSec = prefs.getUInt("histPer", HIST_PERIOD_DEF_S);
   if (histPoints < HISTORY_MIN_POINTS || histPoints > HISTORY_MAX_POINTS) histPoints = HISTORY_DEF_POINTS;
@@ -265,6 +279,8 @@ void saveSettings() {
   prefs.putBool("ledTxEn", ledTxEn);
   prefs.putBytes("siteLabel", siteLabel, strlen(siteLabel) + 1);
   prefs.putBytes("hostName", hostName, strlen(hostName) + 1);
+  prefs.putBool("apiEn", apiEnabled);
+  prefs.putBytes("apiPw", apiPassword, strlen(apiPassword) + 1);
   prefs.putUShort("histPts", histPoints);
   prefs.putUInt("histPer", histPeriodSec);
   prefs.end();
@@ -931,6 +947,100 @@ static bool copyParam(AsyncWebServerRequest* req, const char* name, char* dst, s
 }
 
 // ════════════════════════════════════════════════════════
+//  ▸ ВНЕШНИЙ API (/api/sensor) — включается и защищается паролем в кабинете
+//    Работает независимо от сессии кабинета (cookie не нужен).
+// ════════════════════════════════════════════════════════
+// Сравнение без раннего выхода — время ответа не зависит от числа совпавших символов
+static bool apiKeyEquals(const char* a, const char* b) {
+  size_t la = strlen(a), lb = strlen(b);
+  uint8_t diff = (la != lb);
+  for (size_t i = 0; i < la && i < lb; i++) diff |= (uint8_t)(a[i] ^ b[i]);
+  return diff == 0;
+}
+
+// Пароль API: 4–32 печатных ASCII-символа без пробелов (он передаётся в HTTP-заголовке или URL)
+static bool isValidApiPassword(const String& s) {
+  if (s.length() < 4 || s.length() > 32) return false;
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c < 0x21 || c > 0x7E) return false;
+  }
+  return true;
+}
+
+// true — доступ разрешён; иначе ответ (403/401) уже отправлен
+static bool checkApiAccess(AsyncWebServerRequest* req) {
+  if (!apiEnabled) {
+    req->send(403, "application/json", "{\"error\":\"api disabled\"}");
+    return false;
+  }
+  if (apiPassword[0] == 0) return true;   // пароль не задан — API открыт
+
+  bool ok = false;
+  if (req->hasHeader("X-API-Key")) {
+    String v = req->header("X-API-Key");
+    v.trim();
+    ok = apiKeyEquals(v.c_str(), apiPassword);
+  }
+  if (!ok && req->hasHeader("Authorization")) {
+    String a = req->header("Authorization");
+    a.trim();
+    if (a.startsWith("Bearer ")) ok = apiKeyEquals(a.c_str() + 7, apiPassword);
+  }
+  if (!ok && req->hasParam("key")) {
+    ok = apiKeyEquals(req->getParam("key")->value().c_str(), apiPassword);
+  }
+  if (ok) return true;
+
+  AsyncWebServerResponse* resp = req->beginResponse(401, "application/json", "{\"error\":\"unauthorized\"}");
+  resp->addHeader("WWW-Authenticate", "Bearer");
+  req->send(resp);
+  return false;
+}
+
+// Показания для API: NAN, если датчик не отвечал дольше минуты (как и в /api/data).
+// false — не удалось взять мьютекс.
+static bool apiSnapshot(float& t, float& h) {
+  t = h = NAN;
+  if (MUTEX_TAKE() != pdTRUE) return false;
+  if (dhtSuccessValid && millis() - lastDhtSuccessTime <= 60000) { t = curTemp; h = curHum; }
+  MUTEX_GIVE();
+  return true;
+}
+
+// what: 'a' — всё в JSON, 't' — температура, 'h' — влажность, 'u' — аптайм (три последних — text/plain)
+static void apiSensorHandler(AsyncWebServerRequest* req, char what) {
+  blinkTx();
+  // Маршрут /api/sensor совпадает и по префиксу (/api/sensor/что-угодно) — лишнее отсекаем
+  if (what == 'a' && req->url() != "/api/sensor") { req->send(404, "text/plain", "Not found"); return; }
+  if (!checkApiAccess(req)) return;
+
+  float t, h;
+  if (!apiSnapshot(t, h)) { req->send(503, "application/json", "{\"error\":\"busy\"}"); return; }
+  // 64-битный счётчик: в отличие от millis() не обнуляется через 49 суток
+  unsigned long uptime = (unsigned long)(esp_timer_get_time() / 1000000LL);
+
+  char buf[128];
+  if (what == 'a') {
+    char ts[16], hs[16];
+    if (isnan(t)) strcpy(ts, "null"); else snprintf(ts, sizeof(ts), "%.1f", t);
+    if (isnan(h)) strcpy(hs, "null"); else snprintf(hs, sizeof(hs), "%.1f", h);
+    snprintf(buf, sizeof(buf), "{\"temperature\":%s,\"humidity\":%s,\"uptime\":%lu}", ts, hs, uptime);
+    req->send(200, "application/json", buf);
+    return;
+  }
+  if (what == 'u') {
+    snprintf(buf, sizeof(buf), "%lu", uptime);
+    req->send(200, "text/plain", buf);
+    return;
+  }
+  float v = (what == 't') ? t : h;
+  if (isnan(v)) { req->send(503, "text/plain", "unavailable"); return; }
+  snprintf(buf, sizeof(buf), "%.1f", v);
+  req->send(200, "text/plain", buf);
+}
+
+// ════════════════════════════════════════════════════════
 //  ▸ HTML / JS ресурсы (вынесены в web_pages.h)
 // ════════════════════════════════════════════════════════
 #include "web_pages.h"
@@ -998,6 +1108,12 @@ void setup() {
     blinkTx();
     req->send(200, "application/json", buildApiJson());
   });
+
+  // Внешний API. Подпути регистрируются раньше /api/sensor: маршруты сопоставляются по префиксу.
+  server.on("/api/sensor/temperature", HTTP_GET, [](AsyncWebServerRequest* req) { apiSensorHandler(req, 't'); });
+  server.on("/api/sensor/humidity",    HTTP_GET, [](AsyncWebServerRequest* req) { apiSensorHandler(req, 'h'); });
+  server.on("/api/sensor/uptime",      HTTP_GET, [](AsyncWebServerRequest* req) { apiSensorHandler(req, 'u'); });
+  server.on("/api/sensor",             HTTP_GET, [](AsyncWebServerRequest* req) { apiSensorHandler(req, 'a'); });
 
   // Страница входа
   server.on("/login", HTTP_GET, [](AsyncWebServerRequest* req) {
@@ -1141,13 +1257,14 @@ void setup() {
     snprintf(buf, sizeof(buf),
              "{\"tempOffset\":%.2f,\"batMax\":%.2f,\"batMin\":%.2f,\"batR1\":%.1f,\"batR2\":%.1f,\"batCalib\":%.4f,\"ledWifiEn\":%s,\"ledTxEn\":%s,\"siteLabel\":\"%s\",\"wifiSSID\":\"%s\","
              "\"ipMode\":\"%s\",\"ip\":\"%s\",\"gateway\":\"%s\",\"subnet\":\"%s\",\"dns1\":\"%s\",\"dns2\":\"%s\",\"currentIp\":\"%s\",\"hostName\":\"%s\","
-             "\"histPoints\":%u,\"histPeriodSec\":%lu,\"histMinPoints\":%d,\"histMaxPoints\":%d,\"histMinPeriod\":%lu,\"histMaxPeriod\":%lu}",
+             "\"histPoints\":%u,\"histPeriodSec\":%lu,\"histMinPoints\":%d,\"histMaxPoints\":%d,\"histMinPeriod\":%lu,\"histMaxPeriod\":%lu,\"apiEn\":%s,\"apiPwSet\":%s}",
              tempOffset, batMax, batMin, batR1, batR2, batCalib,
              ledWifiEn ? "true" : "false", ledTxEn ? "true" : "false", lbl, ssid,
              staticIpEnabled ? "static" : "dhcp", staticIp, staticGateway, staticSubnet, staticDns1, staticDns2,
              WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "", hostName,
              (unsigned)histPoints, (unsigned long)histPeriodSec, HISTORY_MIN_POINTS, HISTORY_MAX_POINTS,
-             (unsigned long)HIST_PERIOD_MIN_S, (unsigned long)HIST_PERIOD_MAX_S);
+             (unsigned long)HIST_PERIOD_MIN_S, (unsigned long)HIST_PERIOD_MAX_S,
+             apiEnabled ? "true" : "false", apiPassword[0] ? "true" : "false");
     req->send(200, "application/json", buf);
   });
 
@@ -1184,6 +1301,31 @@ void setup() {
       }
       MUTEX_GIVE();
       changed = true;
+    }
+    // Параметры API проверяем сразу, а применяем в конце — при ошибке ничего не окажется изменённым наполовину.
+    // Пароль API: пустое поле = «не менять», apiPwClear=1 = удалить (API без пароля).
+    bool apiChange = false;
+    bool newApiEn  = apiEnabled;
+    char newApiPw[sizeof(apiPassword)];
+    strcpy(newApiPw, apiPassword);
+    if (req->hasParam("apiEn", true)) {
+      newApiEn = req->getParam("apiEn", true)->value().toInt() != 0;
+      apiChange = true;
+    }
+    if (req->hasParam("apiPwClear", true) && req->getParam("apiPwClear", true)->value().toInt() != 0) {
+      newApiPw[0] = 0;
+      apiChange = true;
+    }
+    if (req->hasParam("apiPw", true)) {
+      const String& v = req->getParam("apiPw", true)->value();
+      if (v.length() > 0) {
+        if (!isValidApiPassword(v)) {
+          req->send(200, "application/json", "{\"ok\":false,\"err\":\"Пароль API: 4–32 символа, латиница, цифры и знаки без пробелов\"}");
+          return;
+        }
+        strcpy(newApiPw, v.c_str());
+        apiChange = true;
+      }
     }
     if (req->hasParam("tempOffset", true)) {
       tempOffset = req->getParam("tempOffset", true)->value().toFloat();
@@ -1228,6 +1370,11 @@ void setup() {
       }
       strncpy(siteLabel, v.c_str(), sizeof(siteLabel) - 1);
       siteLabel[sizeof(siteLabel) - 1] = 0;
+      changed = true;
+    }
+    if (apiChange) {
+      apiEnabled = newApiEn;
+      strcpy(apiPassword, newApiPw);
       changed = true;
     }
     if (changed) {
@@ -1509,6 +1656,7 @@ static void processSerialCommand(char* cmd) {
       if (WiFi.status() != WL_CONNECTED && wifiDisconnectedSince > 0) {
         Serial.printf("  Нет связи: %lu сек\n", (millis() - wifiDisconnectedSince) / 1000UL);
       }
+      Serial.printf("  API: %s, пароль %s\n", apiEnabled ? "включён" : "выключен", apiPassword[0] ? "задан" : "не задан");
       Serial.printf("  Температура: %.1f °C\n", curTemp);
       Serial.printf("  Влажность: %.1f %%\n", curHum);
       float vBat = filteredBatVolts;  // читаем из основного потока, гонки нет

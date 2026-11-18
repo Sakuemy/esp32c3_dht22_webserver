@@ -752,6 +752,28 @@ select option{background:#1e293b}
       </div>
     </div>
 
+    <!-- Категория: API -->
+    <div class="sett-card">
+      <h3>API</h3>
+      <div class="sett-group-row">
+        <label class="switch-label">
+          <input type="checkbox" id="setApiEn">
+          <span class="switch-text">Включить API (температура, влажность, аптайм)</span>
+        </label>
+      </div>
+      <div class="sett-group">
+        <label for="setApiPw">Пароль API</label>
+        <input type="password" id="setApiPw" maxlength="32" autocomplete="new-password">
+      </div>
+      <div class="sett-group-row" id="apiPwClearRow" style="display:none">
+        <label class="switch-label">
+          <input type="checkbox" id="setApiPwClear" onchange="refreshApiUi()">
+          <span class="switch-text">Удалить пароль (API станет открытым)</span>
+        </label>
+      </div>
+      <div class="hint" id="apiHint"></div>
+    </div>
+
     <!-- Категория 5: Уведомления — границы -->
     <div class="sett-card">
       <h3>Уведомления: границы</h3>
@@ -978,6 +1000,11 @@ function loadConfig() {
       document.getElementById('setBatCalib').value = d.batCalib !== undefined ? d.batCalib : 1.0;
       document.getElementById('setLedWifi').checked = d.ledWifiEn;
       document.getElementById('setLedTx').checked = d.ledTxEn;
+      document.getElementById('setApiEn').checked = !!d.apiEn;
+      document.getElementById('setApiPw').value = '';
+      document.getElementById('setApiPwClear').checked = false;
+      apiPwSet = !!d.apiPwSet;
+      refreshApiUi();
       if (d.histPoints !== undefined) {
         document.getElementById('setHistPoints').value = d.histPoints;
         // Показываем период в самой крупной единице, на которую он делится без остатка (600 с → 10 мин)
@@ -995,6 +1022,19 @@ function loadConfig() {
 }
 
 const $ = id => document.getElementById(id);
+
+// ── API: состояние поля пароля и подсказка ────────────────
+let apiPwSet = false;   // на устройстве уже задан пароль API (сам пароль не передаётся)
+function refreshApiUi() {
+  const clr = $('setApiPwClear').checked;
+  $('setApiPw').disabled = clr;
+  if (clr) $('setApiPw').value = '';
+  $('setApiPw').placeholder = apiPwSet ? 'сохранён — оставьте пустым, чтобы не менять' : 'не задан — API без пароля';
+  $('apiPwClearRow').style.display = apiPwSet ? '' : 'none';
+  $('apiHint').textContent = 'GET ' + location.origin + '/api/sensor → {"temperature":..,"humidity":..,"uptime":..}. ' +
+    'Отдельно: /api/sensor/temperature, /humidity, /uptime. Пароль — заголовком X-API-Key или Authorization: Bearer, ' +
+    'либо параметром ?key=. Соединение не шифруется (HTTP).';
+}
 
 // ── График: период и число точек ─────────────────────────
 let histLoaded = null;   // период, с которым открыта страница (чтобы предупредить о сбросе истории)
@@ -1230,6 +1270,9 @@ function saveAllSettings() {
   const ledWifi = document.getElementById('setLedWifi').checked ? 1 : 0;
   const ledTx = document.getElementById('setLedTx').checked ? 1 : 0;
   const pw = document.getElementById('setNewPassword').value.trim();
+  const apiEn = $('setApiEn').checked ? 1 : 0;
+  const apiClr = $('setApiPwClear').checked;
+  const apiPw = apiClr ? '' : $('setApiPw').value;
   
   if (isNaN(offset) || isNaN(batMax) || isNaN(batMin) || isNaN(batR1) || isNaN(batR2) || isNaN(batCalib)) {
     errDiv.textContent = 'Заполните все числовые поля корректно';
@@ -1237,6 +1280,11 @@ function saveAllSettings() {
   }
   if (!siteLabel) {
     errDiv.textContent = 'Введите подпись для главной страницы';
+    return;
+  }
+
+  if (apiPw && !/^[\x21-\x7E]{4,32}$/.test(apiPw)) {
+    errDiv.textContent = 'Пароль API: 4–32 символа, латиница, цифры и знаки без пробелов';
     return;
   }
 
@@ -1255,7 +1303,8 @@ function saveAllSettings() {
     return;
   }
   
-  const body = `histPoints=${histPts}&histPeriodSec=${histPer}&siteLabel=${encodeURIComponent(siteLabel)}&tempOffset=${encodeURIComponent(offset)}&batMax=${encodeURIComponent(batMax)}&batMin=${encodeURIComponent(batMin)}&batR1=${encodeURIComponent(batR1)}&batR2=${encodeURIComponent(batR2)}&batCalib=${encodeURIComponent(batCalib)}&ledWifiEn=${ledWifi}&ledTxEn=${ledTx}`;
+  const body = `histPoints=${histPts}&histPeriodSec=${histPer}&siteLabel=${encodeURIComponent(siteLabel)}&tempOffset=${encodeURIComponent(offset)}&batMax=${encodeURIComponent(batMax)}&batMin=${encodeURIComponent(batMin)}&batR1=${encodeURIComponent(batR1)}&batR2=${encodeURIComponent(batR2)}&batCalib=${encodeURIComponent(batCalib)}&ledWifiEn=${ledWifi}&ledTxEn=${ledTx}&apiEn=${apiEn}`
+    + (apiClr ? '&apiPwClear=1' : '') + (apiPw ? '&apiPw=' + encodeURIComponent(apiPw) : '');
   
   fetch('/api/settings/save', {
     method: 'POST',
@@ -1268,6 +1317,10 @@ function saveAllSettings() {
         throw new Error(d.err || 'Ошибка при сохранении настроек');
       }
       histLoaded = { sec: histPer };
+      if (apiClr) apiPwSet = false; else if (apiPw) apiPwSet = true;
+      $('setApiPw').value = '';
+      $('setApiPwClear').checked = false;
+      refreshApiUi();
       return saveNotify();
     })
     .then(() => {
