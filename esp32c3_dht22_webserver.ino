@@ -7,7 +7,7 @@
  *   GPIO13 — LED TX  (моргает при HTTP-запросе)
  *
  * HTTP API (включается в кабинете, по умолчанию выключен):
- *   GET /api/sensor              — {"temperature":..,"humidity":..,"uptime":..}
+ *   GET /api/sensor              — {"label":"..","temperature":..,"humidity":..,"uptime":..}
  *   GET /api/sensor/temperature  — только температура (text/plain)
  *   GET /api/sensor/humidity     — только влажность   (text/plain)
  *   GET /api/sensor/uptime       — только аптайм, сек (text/plain)
@@ -1020,12 +1020,14 @@ static void apiSensorHandler(AsyncWebServerRequest* req, char what) {
   // 64-битный счётчик: в отличие от millis() не обнуляется через 49 суток
   unsigned long uptime = (unsigned long)(esp_timer_get_time() / 1000000LL);
 
-  char buf[128];
+  char buf[256];
   if (what == 'a') {
     char ts[16], hs[16];
+    char lbl[sizeof(siteLabel) * 2];
+    jsonEscape(lbl, sizeof(lbl), siteLabel);   // подпись устройства из настроек
     if (isnan(t)) strcpy(ts, "null"); else snprintf(ts, sizeof(ts), "%.1f", t);
     if (isnan(h)) strcpy(hs, "null"); else snprintf(hs, sizeof(hs), "%.1f", h);
-    snprintf(buf, sizeof(buf), "{\"temperature\":%s,\"humidity\":%s,\"uptime\":%lu}", ts, hs, uptime);
+    snprintf(buf, sizeof(buf), "{\"label\":\"%s\",\"temperature\":%s,\"humidity\":%s,\"uptime\":%lu}", lbl, ts, hs, uptime);
     req->send(200, "application/json", buf);
     return;
   }

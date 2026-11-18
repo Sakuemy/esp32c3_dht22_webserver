@@ -1031,7 +1031,7 @@ function refreshApiUi() {
   if (clr) $('setApiPw').value = '';
   $('setApiPw').placeholder = apiPwSet ? 'сохранён — оставьте пустым, чтобы не менять' : 'не задан — API без пароля';
   $('apiPwClearRow').style.display = apiPwSet ? '' : 'none';
-  $('apiHint').textContent = 'GET ' + location.origin + '/api/sensor → {"temperature":..,"humidity":..,"uptime":..}. ' +
+  $('apiHint').textContent = 'GET ' + location.origin + '/api/sensor → {"label":"..","temperature":..,"humidity":..,"uptime":..}. ' +
     'Отдельно: /api/sensor/temperature, /humidity, /uptime. Пароль — заголовком X-API-Key или Authorization: Bearer, ' +
     'либо параметром ?key=. Соединение не шифруется (HTTP).';
 }

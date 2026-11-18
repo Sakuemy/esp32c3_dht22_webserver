@@ -105,7 +105,7 @@
 
 | Метод и путь | Ответ |
 |---|---|
-| `GET /api/sensor` | JSON с температурой, влажностью и аптаймом |
+| `GET /api/sensor` | JSON с названием устройства, температурой, влажностью и аптаймом |
 | `GET /api/sensor/temperature` | температура, `text/plain` |
 | `GET /api/sensor/humidity` | влажность, `text/plain` |
 | `GET /api/sensor/uptime` | аптайм в секундах, `text/plain` |
@@ -113,9 +113,10 @@
 Пример ответа `/api/sensor`:
 
 ```json
-{"temperature":23.4,"humidity":45.1,"uptime":86400}
+{"label":"ESP32-C3 Monitor","temperature":23.4,"humidity":45.1,"uptime":86400}
 ```
 
+- `label` — название устройства: подпись, заданная в настройках («Подпись слева сверху на главной странице»).
 - `temperature` — °C, `humidity` — %, `uptime` — секунды с момента включения.
 - Если датчик не отвечал дольше минуты, `temperature` и `humidity` равны `null`; на отдельных эндпоинтах в этом случае возвращается `503 unavailable`.
 
