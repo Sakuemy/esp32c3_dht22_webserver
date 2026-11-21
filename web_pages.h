@@ -177,6 +177,30 @@ function showToast(msg, type = 'error') {
     ctx.strokeStyle='#334155';ctx.lineWidth=0.5;
     for(let g=0;g<=4;g++){const y=PT+(g/4)*PH;ctx.beginPath();ctx.moveTo(PL,y);ctx.lineTo(PL+PW,y);ctx.stroke();}
 
+    // Разделители: день — пунктир, неделя (понедельник) — сплошная линия
+    ctx.save();
+    ctx.font='16px system-ui';ctx.textAlign='left';
+    for(let i=1;i<N;i++){
+      const t0=TMS[i-1],t1=TMS[i];
+      if(t1<=t0)continue;
+      const a=new Date(t0*1000);
+      let m=new Date(a.getFullYear(),a.getMonth(),a.getDate()+1); // ближайшая полночь после t0
+      while(m.getTime()/1000<=t1){
+        const tm=m.getTime()/1000;
+        const x=xOf(i-1)+(tm-t0)/(t1-t0)*(xOf(i)-xOf(i-1));
+        const isWeek=m.getDay()===1; // понедельник
+        ctx.beginPath();
+        if(isWeek){ctx.setLineDash([]);ctx.strokeStyle='#94a3b8';ctx.lineWidth=1.5;}
+        else{ctx.setLineDash([5,5]);ctx.strokeStyle='#64748b';ctx.lineWidth=1;}
+        ctx.moveTo(x,PT);ctx.lineTo(x,PT+PH);ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle=isWeek?'#94a3b8':'#64748b';
+        ctx.fillText(p2(m.getDate())+'.'+p2(m.getMonth()+1),x+4,PT+14);
+        m=new Date(m.getFullYear(),m.getMonth(),m.getDate()+1);
+      }
+    }
+    ctx.restore();
+
     // Ось Y слева — температура
     ctx.fillStyle='#fb923c';ctx.font='20px system-ui';ctx.textAlign='right';
     for(let g=0;g<=4;g++){
