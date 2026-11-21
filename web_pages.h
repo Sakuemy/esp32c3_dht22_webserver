@@ -809,7 +809,7 @@ select option{background:#1e293b}
       <div class="sett-group-row">
         <label class="switch-label">
           <input type="checkbox" id="setApiEn">
-          <span class="switch-text">Включить API (температура, влажность, аптайм)</span>
+          <span class="switch-text">Включить API (имя устройства, температура, влажность, аптайм)</span>
         </label>
       </div>
       <div class="sett-group">
@@ -1083,7 +1083,8 @@ function refreshApiUi() {
   $('setApiPw').placeholder = apiPwSet ? 'сохранён — оставьте пустым, чтобы не менять' : 'не задан — API без пароля';
   $('apiPwClearRow').style.display = apiPwSet ? '' : 'none';
   $('apiHint').textContent = 'GET ' + location.origin + '/api/sensor → {"label":"..","temperature":..,"humidity":..,"uptime":..}. ' +
-    'Отдельно: /api/sensor/temperature, /humidity, /uptime. Пароль — заголовком X-API-Key или Authorization: Bearer, ' +
+    'В поле label передаётся имя устройства — то, что указано в поле «Подпись слева сверху на главной странице». ' +
+    'Отдельно: /api/sensor/temperature, /humidity, /uptime — только значение, без имени. Пароль — заголовком X-API-Key или Authorization: Bearer, ' +
     'либо параметром ?key=. Соединение не шифруется (HTTP).';
 }
 
