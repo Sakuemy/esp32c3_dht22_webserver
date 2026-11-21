@@ -141,6 +141,12 @@ function showToast(msg, type = 'error') {
   let data={step:60,times:[],temp:[],hum:[]};
   // Сохраняем параметры последней отрисовки для tooltip
   let lastDraw={PL:0,PR:0,PT:0,PB:0,PW:0,PH:0,N:0,tMn:0,tMx:0,CW:0,CH:0};
+  // Индекс точки под курсором (-1 — нет), для подсветки на графике
+  let hoverIdx=-1;
+  function hideTip(){
+    tip.style.display='none';
+    if(hoverIdx!==-1){hoverIdx=-1;draw();}
+  }
 
   function resize(){
     // Размер битмапа берём от реального CSS-размера canvas (а не контейнера),
@@ -269,6 +275,26 @@ function showToast(msg, type = 'error') {
       ctx.beginPath();ctx.arc(xOf(i),yH(HUM[i]),2.5,0,2*Math.PI);ctx.fillStyle='#1e293b';ctx.fill();
     }
 
+    // Подсветка точки под курсором
+    if(hoverIdx>=0&&hoverIdx<N){
+      const hx=xOf(hoverIdx);
+      ctx.save();
+      ctx.setLineDash([]);
+      ctx.strokeStyle='#e2e8f0';ctx.globalAlpha=0.35;ctx.lineWidth=1;
+      ctx.beginPath();ctx.moveTo(hx,PT);ctx.lineTo(hx,PT+PH);ctx.stroke();
+      ctx.globalAlpha=1;
+      [[TMP,yT,'#fb923c'],[HUM,yH,'#38bdf8']].forEach(([arr,yf,col])=>{
+        const v=arr[hoverIdx];
+        if(v===null||v===undefined||isNaN(v))return;
+        const y=yf(v);
+        ctx.beginPath();ctx.arc(hx,y,10,0,2*Math.PI);ctx.fillStyle=col+'44';ctx.fill();
+        ctx.beginPath();ctx.arc(hx,y,6.5,0,2*Math.PI);ctx.fillStyle=col;ctx.fill();
+        ctx.lineWidth=2;ctx.strokeStyle='#f8fafc';ctx.stroke();
+        ctx.beginPath();ctx.arc(hx,y,2.5,0,2*Math.PI);ctx.fillStyle='#1e293b';ctx.fill();
+      });
+      ctx.restore();
+    }
+
     // Легенда
     const lx=PL,ly=CH-12;
     ctx.lineWidth=2.5;
@@ -281,7 +307,7 @@ function showToast(msg, type = 'error') {
   // ── Tooltip при наведении ──────────────────────────────
   cv.addEventListener('mousemove',function(e){
     const {PL,PW,PT,PH,N}=lastDraw;
-    if(N<2){tip.style.display='none';return;}
+    if(N<2){hideTip();return;}
     const rect=cv.getBoundingClientRect();
     const px=e.clientX-rect.left;   // позиция мыши в CSS-пикселях canvas
     const py=e.clientY-rect.top;
@@ -289,9 +315,10 @@ function showToast(msg, type = 'error') {
     const mx=px*(lastDraw.CW/rect.width);
     // Определяем ближайший индекс по X
     const frac=(mx-PL)/PW;
-    if(frac<0||frac>1){tip.style.display='none';return;}
+    if(frac<0||frac>1){hideTip();return;}
     const idx=Math.round(frac*(N-1));
-    if(idx<0||idx>=N){tip.style.display='none';return;}
+    if(idx<0||idx>=N){hideTip();return;}
+    if(hoverIdx!==idx){hoverIdx=idx;draw();}
     const T=data.temp[idx],H=data.hum[idx],ts=data.times[idx];
     const tStr=T!==null&&!isNaN(T)?T.toFixed(1)+' °C':'—';
     const hStr=H!==null&&!isNaN(H)?H.toFixed(1)+' %':'—';
@@ -312,7 +339,7 @@ function showToast(msg, type = 'error') {
     tip.style.left=tx+'px';tip.style.top=ty+'px';
     tip.style.display='block';
   });
-  cv.addEventListener('mouseleave',function(){tip.style.display='none';});
+  cv.addEventListener('mouseleave',hideTip);
 
   // c = {step, last, temp[], hum[]}: время i-й точки восстанавливаем от последней, окна идут строго с шагом step
   window._chartUpdate=function(c){
